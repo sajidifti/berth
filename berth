@@ -1,0 +1,1195 @@
+#!/usr/bin/env bash
+# berth — serve local Laravel projects as http://<name>.localhost with Apache + per-site PHP-FPM.
+# See README.md. Runs as the user; sudo wraps only the system steps.
+set -euo pipefail
+
+BERTH_VERSION=0.1.0
+NVM_TAG=v0.41.0
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/berth"
+CONFIG="$CONFIG_DIR/sites"
+NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+DEFAULT_PHP=8.5
+DEFAULT_NODE=26
+DEFAULT_COMPOSER=2
+COMPOSER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/berth/composer"
+BASE_PKGS=(cli fpm common mysql mbstring xml curl zip gd intl bcmath)
+APACHE_MODS=(mpm_event proxy_fcgi setenvif rewrite)
+VHOST_DIR=/etc/apache2/sites-available
+SITES_ROOT=/srv/sites
+ME=$(id -un)
+MYGROUP=$(id -gn)
+
+# ---------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' RED=$'\e[31m' GRN=$'\e[32m' YEL=$'\e[33m' CYN=$'\e[36m' R=$'\e[0m'
+else
+  B='' D='' RED='' GRN='' YEL='' CYN='' R=''
+fi
+info() { printf '%s\n' "$*"; }
+title() { printf '  %s%s%s\n' "$B" "$*" "$R"; }
+hdetail() { printf '  %s\n' "$*"; }   # lines under a title
+section() { printf '\n%s%s%s\n' "$B" "$*" "$R"; }
+detail() { printf '    %s\n' "$*"; }
+success() { printf '\n  %s✓ %s%s\n' "$GRN$B" "$*" "$R"; }
+failure() { printf '\n  %s✗ %s%s\n' "$RED$B" "$*" "$R"; }
+ok()   { printf '  %s✓%s %s\n' "$GRN" "$R" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$RED" "$R" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YEL$B" "$R" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED$B" "$R" "$*" >&2; exit 1; }
+cmdlog() { printf '      %s+ %s%s\n' "$D" "$*" "$R"; }
+
+# ---------------------------------------------------------------- small helpers
+
+pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+
+has_candidate() {
+  local c
+  c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2}')
+  [[ -n $c && $c != "(none)" ]]
+}
+
+ver_ge() { [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$2" ]]; }
+
+valid_php() { [[ $1 =~ ^[0-9]+\.[0-9]+$ ]]; }
+
+ppa_present() {
+  grep -rqsE 'ppa\.launchpad(content)?\.net/ondrej/php' /etc/apt/sources.list.d/
+}
+
+installed_php_versions() {
+  local d v
+  for d in /etc/php/*/; do
+    v=$(basename "$d")
+    valid_php "$v" && pkg_installed "php$v-fpm" && printf '%s\n' "$v"
+  done | sort -V
+}
+
+available_php_versions() {
+  apt-cache pkgnames php 2>/dev/null | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm$/\1/p' | sort -uV
+}
+
+installed_node_versions() {
+  local d
+  for d in "$NVM_DIR"/versions/node/v*/; do
+    [[ -d $d ]] && basename "$d"
+  done | sed 's/^v//' | sort -V
+}
+
+sanitize_name() {
+  local n=${1,,}
+  n=$(sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//' <<<"$n")
+  printf '%s' "$n"
+}
+
+# Map a composer ext-* name to the php<v>-<pkg> suffix. Prints nothing if built in.
+ext_pkg() {
+  local v=$1 e=${2,,}
+  e=${e#ext-}
+  case $e in
+    ctype|fileinfo|tokenizer|pdo|json|openssl|pcre|session|filter|hash|sodium|zlib|iconv|calendar|\
+    exif|ffi|ftp|gettext|phar|posix|shmop|sockets|sysvmsg|sysvsem|sysvshm|pcntl|random|spl|\
+    reflection|standard|date|core) ;;
+    opcache|zend-opcache) ver_ge "$v" 8.5 || echo opcache ;;
+    dom|simplexml|xmlreader|xmlwriter|xsl|libxml|xml) echo xml ;;
+    mysqli|pdo_mysql|mysqlnd|mysql) echo mysql ;;
+    pdo_sqlite|sqlite3) echo sqlite3 ;;
+    pdo_pgsql|pgsql) echo pgsql ;;
+    *) echo "$e" ;;
+  esac
+}
+
+# composer.json → lines "php<TAB>constraint" and "ext<TAB>name"
+composer_info() {
+  [[ -f $1/composer.json ]] || return 0
+  python3 - "$1/composer.json" <<'PY' 2>/dev/null || true
+import json, sys
+req = json.load(open(sys.argv[1])).get("require", {}) or {}
+if isinstance(req, dict):
+    if "php" in req: print("php\t" + str(req["php"]))
+    for k in req:
+        if k.startswith("ext-"): print("ext\t" + k[4:])
+PY
+}
+
+# Print the versions (X.Y) among $2.. that satisfy composer constraint $1, in input order.
+php_matching() {
+  python3 - "$@" <<'PY'
+import re, sys
+cons, vers = sys.argv[1], sys.argv[2:]
+def pad(n): return tuple((n + [0, 0, 0])[:3])
+def atom(a):
+    a = a.strip()
+    if a in ("", "*"): return lambda v: True
+    m = re.match(r'^(\^|~|>=|<=|>|<|!=|==|=)?v?([0-9][0-9.*xX]*)', a)
+    if not m: return lambda v: True
+    op, ver = m.group(1) or "", m.group(2).rstrip(".")
+    parts = ver.split(".")
+    if any(p in ("*", "x", "X") for p in parts):
+        fixed = []
+        for p in parts:
+            if p in ("*", "x", "X"): break
+            fixed.append(int(p))
+        return lambda v: list(v[:len(fixed)]) == fixed
+    n = [int(p) for p in parts]
+    lo = pad(n)
+    if op == "^":
+        if n[0] > 0: hi = (n[0] + 1, 0, 0)
+        elif len(n) > 1 and n[1] > 0: hi = (0, n[1] + 1, 0)
+        else: hi = (0, 0, (n[2] if len(n) > 2 else 0) + 1)
+        return lambda v: lo <= v < hi
+    if op == "~":
+        hi = (n[0] + 1, 0, 0) if len(n) <= 2 else (n[0], n[1] + 1, 0)
+        return lambda v: lo <= v < hi
+    if op == ">=": return lambda v: v >= lo
+    if op == ">":  return lambda v: v > lo
+    if op == "<=": return lambda v: v <= lo
+    if op == "<":  return lambda v: v < lo
+    if op == "!=": return lambda v: v != lo
+    return lambda v: list(v[:len(n)]) == n
+groups = []
+for g in re.split(r'\|\|?', cons):
+    g = g.strip()
+    h = re.match(r'^(\S+)\s+-\s+(\S+)$', g)
+    if h:
+        lo_n = [int(p) for p in h.group(1).lstrip("v").split(".") if p.isdigit()]
+        hi_n = [int(p) for p in h.group(2).lstrip("v").split(".") if p.isdigit()]
+        groups.append([lambda v, l=pad(lo_n): v >= l,
+                       lambda v, h=hi_n: list(v[:len(h)]) <= h])
+        continue
+    g = re.sub(r'(>=|<=|!=|==|>|<|=|\^|~)\s+', r'\1', g)
+    groups.append([atom(a) for a in re.split(r'[\s,]+', g) if a])
+for ver in vers:
+    mj, mn = (int(x) for x in ver.split("."))
+    if any(all(p((mj, mn, pt)) for p in grp) for grp in groups for pt in range(100)):
+        print(ver)
+PY
+}
+
+# ---------------------------------------------------------------- nvm / node
+
+nvm_run() {
+  [[ -s $NVM_DIR/nvm.sh ]] || return 1
+  (
+    set +eu
+    set +o pipefail
+    export NVM_DIR
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh" --no-use
+    "$@"
+  )
+}
+
+# Print the bin dir of the best installed Node matching a spec (20, v20.1, 24.15.0, default, lts/*).
+node_bin() {
+  local spec=${1#v} base="$NVM_DIR/versions/node" d v
+  if [[ $spec =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+    d=$(ls -1d "$base/v$spec" "$base/v$spec".* 2>/dev/null | sort -V | tail -n1 || true)
+    [[ -n $d && -x $d/bin/node ]] && { printf '%s\n' "$d/bin"; return 0; }
+    return 1
+  fi
+  if [[ $spec == default && -s $NVM_DIR/alias/default ]]; then
+    local a
+    a=$(<"$NVM_DIR/alias/default")
+    [[ $a =~ ^v?[0-9]+(\.[0-9]+){0,2}$ ]] && { node_bin "$a"; return; }
+  fi
+  v=$(nvm_run nvm_version "$spec" 2>/dev/null) || return 1
+  [[ $v == v* && -x $base/$v/bin/node ]] && printf '%s\n' "$base/$v/bin"
+}
+
+# ---------------------------------------------------------------- composer
+
+# Versions: 2 (latest 2.x), 2.2 (LTS line for old PHP), 1, or an exact x.y.z.
+valid_composer() { [[ $1 =~ ^(1|2|2\.2|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; }
+
+composer_phar() { printf '%s/%s.phar' "$COMPOSER_DIR" "$1"; }
+
+composer_channel() {
+  case $1 in
+    1) echo latest-1.x ;;
+    2) echo latest-2.x ;;
+    2.2) echo latest-2.2.x ;;
+    *) echo "$1" ;;
+  esac
+}
+
+installed_composer_versions() {
+  local f
+  for f in "$COMPOSER_DIR"/*.phar; do [[ -f $f ]] && basename "$f" .phar; done | sort -V
+}
+
+# ---------------------------------------------------------------- config (registry)
+
+config_lines() { [[ -f $CONFIG ]] && grep -v '^\s*\(#\|$\)' "$CONFIG" || true; }
+
+# config_get <field:name|path> <value> → "name<TAB>path<TAB>php<TAB>node"
+config_get() {
+  local col=1
+  [[ $1 == path ]] && col=2
+  config_lines | awk -F'\t' -v c="$col" -v v="$2" '$c == v { print; exit }'
+}
+
+config_set() {
+  local name=$1 path=$2 php=$3 node=$4 composer=${5:--} tmp
+  mkdir -p "$CONFIG_DIR"
+  tmp=$(mktemp "$CONFIG_DIR/.sites.XXXXXX")
+  config_lines | awk -F'\t' -v n="$name" -v p="$path" '$1 != n && $2 != p' >"$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$node" "$composer" >>"$tmp"
+  sort -o "$tmp" "$tmp"
+  mv "$tmp" "$CONFIG"
+  cmdlog "updated $CONFIG ($name)"
+}
+
+config_del() {
+  local tmp
+  [[ -f $CONFIG ]] || return 0
+  tmp=$(mktemp "$CONFIG_DIR/.sites.XXXXXX")
+  config_lines | awk -F'\t' -v n="$1" '$1 != n' >"$tmp"
+  mv "$tmp" "$CONFIG"
+  cmdlog "removed $1 from $CONFIG"
+}
+
+# Find the hosted project containing $PWD → config line.
+current_project() {
+  local d
+  d=$(pwd -P)
+  while :; do
+    local line
+    line=$(config_get path "$d")
+    [[ -n $line ]] && { printf '%s\n' "$line"; return 0; }
+    [[ $d == / ]] && return 1
+    d=$(dirname "$d")
+  done
+}
+
+# ---------------------------------------------------------------- permissions (www-data view)
+
+# www_has <path> <r|x>: can www-data (as group, "other" or via ACL) do this on path?
+www_has() {
+  local p=$1 bit=$2 mode grp acl u m
+  mode=$(stat -Lc %A "$p" 2>/dev/null) || return 1
+  grp=$(stat -Lc %G "$p" 2>/dev/null) || return 1
+  case $bit in
+    r) [[ ${mode:7:1} == r ]] && return 0
+       [[ $grp == www-data && ${mode:4:1} == r ]] && return 0 ;;
+    x) [[ ${mode:9:1} == [xt] ]] && return 0
+       [[ $grp == www-data && ${mode:6:1} == [xs] ]] && return 0 ;;
+  esac
+  acl=$(getfacl -cp "$p" 2>/dev/null) || return 1
+  u=$(sed -n 's/^user:www-data:\([rwx-]*\).*/\1/p' <<<"$acl")
+  [[ -n $u && $u == *"$bit"* ]] || return 1
+  m=$(sed -n 's/^mask::\([rwx-]*\).*/\1/p' <<<"$acl")
+  [[ -z $m || $m == *"$bit"* ]]
+}
+
+# Is $1 the home folder or inside it?
+in_home() {
+  local h
+  h=$(readlink -f "$HOME")
+  [[ $1 == "$h" || $1 == "$h"/* ]]
+}
+
+# public/storage pointing into home (e.g. an absolute storage:link made before moving) → prints target
+storage_link_in_home() {
+  local t
+  [[ -L $1/public/storage ]] || return 1
+  t=$(readlink -f "$1/public/storage") || return 1
+  in_home "$t" && printf '%s\n' "$t"
+}
+
+www_reaches() { # every ancestor of $1 traversable
+  local d=$1
+  while d=$(dirname "$d"); [[ $d != / ]]; do www_has "$d" x || return 1; done
+}
+
+acl_ok() {
+  local pub=$1/public t
+  www_reaches "$pub" && www_has "$pub" x && www_has "$pub" r && www_has "$pub/index.php" r || return 1
+  if [[ -L $pub/storage ]]; then
+    t=$(readlink -f "$pub/storage") || return 0
+    [[ -d $t ]] || return 0
+    in_home "$t" && return 0   # can't be fixed by berth; host/doctor warn about it
+    www_reaches "$t" && www_has "$t" x && www_has "$t" r || return 1
+  fi
+}
+
+acl_grant_tree() { # traverse to $1, read the tree, default ACL for new files
+  local t=$1 d=$1
+  while d=$(dirname "$d"); [[ $d != / ]]; do
+    if ! www_has "$d" x; then
+      in_home "$d" && die "$d is inside your home folder; move the project under $SITES_ROOT"
+      cmdlog "setfacl -m u:www-data:x $d"
+      setfacl -m u:www-data:x "$d" || die "cannot set an ACL on $d (is it owned by you?)"
+    fi
+  done
+  cmdlog "setfacl -R -m u:www-data:rX $t (+ default ACL on dirs)"
+  setfacl -R -m u:www-data:rX "$t"
+  find "$t" -type d -exec setfacl -m d:u:www-data:rX {} +
+}
+
+do_acl() {
+  local pub=$1/public t
+  acl_grant_tree "$pub"
+  if [[ -L $pub/storage ]] && t=$(readlink -f "$pub/storage") && [[ -d $t ]] && ! in_home "$t"; then
+    acl_grant_tree "$t"
+  fi
+}
+
+# ---------------------------------------------------------------- generated files
+
+pool_file() { printf '/etc/php/%s/fpm/pool.d/berth.conf' "$1"; }
+pool_sock() { printf '/run/php/php%s-berth.sock' "$1"; }
+
+pool_content() {
+  cat <<EOF
+; Managed by berth. Changes are overwritten.
+[berth]
+user = $ME
+group = $MYGROUP
+listen = $(pool_sock "$1")
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 60s
+pm.max_requests = 500
+chdir = /
+catch_workers_output = yes
+decorate_workers_output = no
+EOF
+}
+
+vhost_file() { printf '%s/berth-%s.conf' "$VHOST_DIR" "$1"; }
+vhost_enabled() { [[ -e /etc/apache2/sites-enabled/berth-$1.conf ]]; }
+
+vhost_content() {
+  local name=$1 path=$2 php=$3
+  cat <<EOF
+# Managed by berth. Changes are overwritten by \`berth host\`.
+<VirtualHost *:80>
+    ServerName $name.localhost
+    ServerAlias *.$name.localhost
+    DocumentRoot "$path/public"
+
+    <Directory "$path/public">
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    <FilesMatch "\.php$">
+        SetHandler "proxy:unix:$(pool_sock "$php")|fcgi://berth-php$php"
+    </FilesMatch>
+
+    ErrorLog \${APACHE_LOG_DIR}/berth-$name-error.log
+    CustomLog \${APACHE_LOG_DIR}/berth-$name-access.log combined
+</VirtualHost>
+EOF
+}
+
+# ---------------------------------------------------------------- plan / run engine
+
+PLAN=() TODO=() KIND=()
+NEED_ROOT=0 YES=0 DRYRUN=0
+APT_UPDATED=0 APACHE_DIRTY=0 APACHE_RESTART=0 APPLY_QUEUED=0 SUDO_PID=
+
+plan_root() { local d=$1; shift; PLAN+=("$d"); KIND+=(root); TODO+=("$(printf '%q ' "$@")"); NEED_ROOT=1; }
+plan_user() { local d=$1; shift; PLAN+=("$d"); KIND+=(user); TODO+=("$(printf '%q ' "$@")"); }
+
+# The reload is appended by run_plan so it always comes after every Apache change.
+queue_apache_apply() { APPLY_QUEUED=1; }
+
+sudo_begin() {
+  [[ -n $SUDO_PID ]] && return 0
+  printf '  %sAdmin rights are needed for system changes.%s\n' "$D" "$R"
+  sudo -v || die "sudo failed"
+  ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 50; done ) &
+  SUDO_PID=$!
+  trap 'kill "$SUDO_PID" 2>/dev/null || true' EXIT
+}
+
+# Execute the queued steps (or list them with --dry-run). Returns 1 when there was nothing to do.
+run_plan() {
+  if (( APPLY_QUEUED )); then
+    APPLY_QUEUED=0
+    plan_root "apache2ctl configtest, then reload Apache" do_apache_apply
+  fi
+  local i n=${#PLAN[@]}
+  (( n == 0 )) && return 1
+  if (( DRYRUN )); then
+    echo
+    printf '  %sDry run. These steps would run:%s\n' "$D" "$R"
+    for i in "${!PLAN[@]}"; do
+      printf '  %2d. %s %s[%s]%s\n' "$((i + 1))" "${PLAN[$i]}" "$D" "${KIND[$i]}" "$R"
+    done
+    exit 0
+  fi
+  echo
+  (( NEED_ROOT )) && sudo_begin
+  for i in "${!TODO[@]}"; do
+    printf '  %s[%d/%d]%s %s\n' "$CYN" "$((i + 1))" "$n" "$R" "${PLAN[$i]}"
+    eval "${TODO[$i]}"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- actions
+
+sudo_run() { cmdlog "sudo $*"; sudo "$@"; }
+
+sudo_write() {
+  cmdlog "sudo tee $1"
+  printf '%s\n' "$2" | sudo tee "$1" >/dev/null
+}
+
+do_apt_install() {
+  local p missing=()
+  if (( ! APT_UPDATED )); then
+    for p in "$@"; do has_candidate "$p" || missing+=("$p"); done
+    if (( ${#missing[@]} )); then
+      sudo_run apt-get update
+      APT_UPDATED=1
+    fi
+  fi
+  missing=()
+  for p in "$@"; do has_candidate "$p" || missing+=("$p"); done
+  (( ${#missing[@]} == 0 )) || die "apt has no package named: ${missing[*]}"
+  sudo_run env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+do_add_ppa() {
+  if ! command -v add-apt-repository >/dev/null; then
+    do_apt_install software-properties-common
+  fi
+  sudo_run env DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:ondrej/php
+  APT_UPDATED=1
+}
+
+do_apache_mods() { # do_apache_mods "<to disable>" "<to enable>"
+  local dis=$1 en=$2
+  # shellcheck disable=SC2086
+  [[ -n $dis ]] && sudo_run a2dismod -q $dis
+  # shellcheck disable=SC2086
+  [[ -n $en ]] && sudo_run a2enmod -q $en
+  APACHE_DIRTY=1
+  [[ $dis == *mpm_* || $en == *mpm_* ]] && APACHE_RESTART=1
+  return 0
+}
+
+do_pool() {
+  local v=$1
+  sudo_write "$(pool_file "$v")" "$(pool_content "$v")"
+  sudo_run systemctl restart "php$v-fpm"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [[ -S $(pool_sock "$v") ]] && return 0; sleep 0.3; done
+  die "php$v-fpm restarted but $(pool_sock "$v") did not appear; see /var/log/php$v-fpm.log"
+}
+
+do_fpm_restart() { sudo_run systemctl restart "php$1-fpm"; }
+
+configtest() {
+  local out
+  if ! out=$(sudo apache2ctl configtest 2>&1); then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+}
+
+do_vhost() {
+  local name=$1 content=$2 f backup=
+  f=$(vhost_file "$name")
+  [[ -f $f ]] && backup=$(cat "$f")
+  sudo_write "$f" "$content"
+  vhost_enabled "$name" || sudo_run a2ensite -q "berth-$name"
+  cmdlog "sudo apache2ctl configtest"
+  if ! configtest; then
+    if [[ -n $backup ]]; then
+      sudo_write "$f" "$backup"
+    else
+      sudo a2dissite -q "berth-$name" 2>/dev/null || true
+      sudo rm -f "$f"
+    fi
+    die "Apache config test failed; the vhost for $name was rolled back"
+  fi
+  APACHE_DIRTY=1
+}
+
+do_vhost_remove() {
+  local name=$1
+  vhost_enabled "$name" && sudo_run a2dissite -q "berth-$name"
+  [[ -f $(vhost_file "$name") ]] && sudo_run rm -f "$(vhost_file "$name")"
+  APACHE_DIRTY=1
+}
+
+do_apache_apply() {
+  (( APACHE_DIRTY )) || return 0
+  cmdlog "sudo apache2ctl configtest"
+  configtest || die "Apache config test failed; Apache was not reloaded"
+  if (( APACHE_RESTART )); then
+    sudo_run systemctl restart apache2
+  else
+    sudo_run systemctl reload-or-restart apache2
+  fi
+}
+
+do_nvm_install() {
+  local tmp
+  tmp=$(mktemp)
+  cmdlog "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_TAG/install.sh | bash"
+  curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_TAG/install.sh" -o "$tmp"
+  NVM_DIR="$NVM_DIR" bash "$tmp"
+  rm -f "$tmp"
+}
+
+do_node_install() {
+  cmdlog "nvm install $1"
+  nvm_run nvm install "$1" || die "nvm install $1 failed"
+}
+
+do_composer_install() {
+  local v=$1 url tmp sum want got
+  url="https://getcomposer.org/download/$(composer_channel "$v")/composer.phar"
+  mkdir -p "$COMPOSER_DIR"
+  tmp=$(mktemp "$COMPOSER_DIR/.download.XXXXXX")
+  cmdlog "curl -fsSL $url"
+  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; die "download failed: $url (does Composer $v exist?)"; }
+  sum=$(curl -fsSL "$url.sha256sum") || { rm -f "$tmp"; die "checksum download failed: $url.sha256sum"; }
+  want=${sum%% *}
+  got=$(sha256sum "$tmp" | cut -d' ' -f1)
+  [[ $want == "$got" ]] || { rm -f "$tmp"; die "checksum mismatch for Composer $v (want $want, got $got)"; }
+  chmod 755 "$tmp"
+  mv "$tmp" "$(composer_phar "$v")"
+  cmdlog "saved $(composer_phar "$v") (sha256 ok)"
+}
+
+do_config_set() { config_set "$@"; }
+do_config_del() { config_del "$@"; }
+
+# ---------------------------------------------------------------- planners (checks only, no changes)
+
+plan_sites_root() {
+  local want="$ME:www-data 750"
+  if [[ ! -d $SITES_ROOT ]]; then
+    plan_root "create $SITES_ROOT (owner $ME, group www-data, mode 750) for your projects" do_sites_root
+  elif [[ $(stat -c '%U:%G %a' "$SITES_ROOT") != "$want" ]]; then
+    plan_root "set $SITES_ROOT to owner $ME, group www-data, mode 750 (now $(stat -c '%U:%G %a' "$SITES_ROOT"))" do_sites_root
+  fi
+  return 0
+}
+
+do_sites_root() {
+  sudo_run install -d -o "$ME" -g www-data -m 750 "$SITES_ROOT"
+  sudo_run chown "$ME:www-data" "$SITES_ROOT"
+  sudo_run chmod 750 "$SITES_ROOT"
+}
+
+plan_base_tools() {
+  local p missing=()
+  for p in acl curl python3; do pkg_installed "$p" || missing+=("$p"); done
+  (( ${#missing[@]} )) && plan_root "install ${missing[*]}" do_apt_install "${missing[@]}"
+  return 0
+}
+
+plan_ppa() {
+  ppa_present || plan_root "add the ondrej/php PPA (ppa:ondrej/php) and apt-get update" do_add_ppa
+}
+
+plan_php() { # plan_php <v> [ext...]
+  local v=$1 p s pkgs=() missing=()
+  shift
+  plan_ppa
+  for s in "${BASE_PKGS[@]}"; do pkgs+=("php$v-$s"); done
+  for p in "$@"; do
+    s=$(ext_pkg "$v" "$p")
+    [[ -n $s ]] && pkgs+=("php$v-$s")
+  done
+  mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | awk '!seen[$0]++')
+  for p in "${pkgs[@]}"; do pkg_installed "$p" || missing+=("$p"); done
+  (( ${#missing[@]} )) && plan_root "install ${missing[*]}" do_apt_install "${missing[@]}"
+
+  local f
+  f=$(pool_file "$v")
+  if [[ ! -f $f || $(cat "$f") != "$(pool_content "$v")" ]]; then
+    plan_root "write FPM pool $f (runs as $ME, socket $(pool_sock "$v")) and restart php$v-fpm" do_pool "$v"
+  elif [[ ! -S $(pool_sock "$v") ]]; then
+    plan_root "restart php$v-fpm (socket $(pool_sock "$v") missing)" do_fpm_restart "$v"
+  fi
+  return 0
+}
+
+plan_apache() {
+  local m dis=() en=() f
+  pkg_installed apache2 || plan_root "install apache2" do_apt_install apache2
+  for f in /etc/apache2/mods-enabled/php*.load; do
+    [[ -e $f ]] && dis+=("$(basename "$f" .load)")
+  done
+  for m in mpm_prefork mpm_worker; do
+    [[ -e /etc/apache2/mods-enabled/$m.load ]] && dis+=("$m")
+  done
+  for m in "${APACHE_MODS[@]}"; do
+    [[ -e /etc/apache2/mods-enabled/$m.load ]] || en+=("$m")
+  done
+  if (( ${#dis[@]} || ${#en[@]} )); then
+    local d=""
+    (( ${#dis[@]} )) && d+="a2dismod ${dis[*]}; "
+    (( ${#en[@]} )) && d+="a2enmod ${en[*]}"
+    plan_root "${d%; }" do_apache_mods "${dis[*]:-}" "${en[*]:-}"
+    queue_apache_apply
+  fi
+  return 0
+}
+
+plan_composer() {
+  [[ -f $(composer_phar "$1") ]] || plan_user "download Composer $1 to $(composer_phar "$1") (sha256 verified)" do_composer_install "$1"
+}
+
+plan_nvm() {
+  [[ -s $NVM_DIR/nvm.sh ]] && return 0
+  plan_user "install nvm $NVM_TAG into $NVM_DIR (the installer adds a few lines to your shell rc file)" do_nvm_install
+}
+
+plan_node() {
+  local v=$1
+  plan_nvm
+  node_bin "$v" >/dev/null 2>&1 || plan_user "nvm install $v" do_node_install "$v"
+  return 0
+}
+
+# ---------------------------------------------------------------- preflight
+
+preflight() {
+  (( EUID != 0 )) || die "run berth as your user, not root (it calls sudo itself)"
+  [[ -r /etc/os-release ]] && grep -q '^ID=ubuntu$' /etc/os-release || die "berth supports Ubuntu only"
+}
+
+# ---------------------------------------------------------------- argument parsing
+
+OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER=
+ARGS=()
+parse_opts() {
+  while (( $# )); do
+    case $1 in
+      --php) OPT_PHP=${2:?--php needs a version}; shift ;;
+      --php=*) OPT_PHP=${1#*=} ;;
+      --node) OPT_NODE=${2:?--node needs a version or none}; shift ;;
+      --node=*) OPT_NODE=${1#*=} ;;
+      --name) OPT_NAME=${2:?--name needs a value}; shift ;;
+      --name=*) OPT_NAME=${1#*=} ;;
+      --composer) OPT_COMPOSER=${2:?--composer needs a version}; shift ;;
+      --composer=*) OPT_COMPOSER=${1#*=} ;;
+      --ext) OPT_EXT+=",${2:?--ext needs a list}"; shift ;;
+      --ext=*) OPT_EXT+=",${1#*=}" ;;
+      -y|--yes) YES=1 ;;
+      -n|--dry-run) DRYRUN=1 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; ARGS+=("$@"); break ;;
+      -*) die "unknown option: $1" ;;
+      *) ARGS+=("$1") ;;
+    esac
+    shift
+  done
+}
+
+ext_list() { tr ',' '\n' <<<"$OPT_EXT" | sed 's/^ *//; s/ *$//' | grep -v '^$' || true; }
+
+# Interactive version question, printed on stderr:
+#   PHP       installed  8.2  8.3  8.5        (the suggestion is bold)
+#             > 8.5                           (pre-filled; Enter keeps it, or edit it)
+# ask <label> <default> <validator> <list-installed-fn> <is-installed-fn> [display-fn]
+# display-fn, if given, turns an installed value into the text shown (e.g. "2" → "2.11.1").
+# With --yes or no terminal, prints the default without asking.
+ask() {
+  local label=$1 def=$2 valid=$3 list_fn=$4 have_fn=$5 show_fn=${6:-} a v t items=()
+  if (( YES )) || [[ ! -r /dev/tty ]]; then printf '%s\n' "$def"; return; fi
+  while IFS= read -r v; do
+    [[ -z $v ]] && continue
+    t=$v
+    [[ -n $show_fn ]] && t=$("$show_fn" "$v")
+    if [[ $v == "$def" || $v == "$def".* ]]; then items+=("$GRN$B$t$R"); else items+=("$t"); fi
+  done < <("$list_fn")
+  (( ${#items[@]} )) || items=("${D}none yet$R")
+  printf '  %s%-9s%s %sinstalled%s  %s' "$B" "$label" "$R" "$D" "$R" "${items[0]}" >&2
+  (( ${#items[@]} > 1 )) && printf '  %s' "${items[@]:1}" >&2
+  printf '\n' >&2
+  [[ $def == none ]] || "$have_fn" "$def" || printf '            %s+ %s is not installed yet; berth will install it%s\n' "$YEL" "$def" "$R" >&2
+  local prompt=$'\001'"$CYN$B"$'\002'"> "$'\001'"$R"$'\002'
+  while :; do
+    read -e -r -i "$def" -p "            $prompt" a </dev/tty || die "aborted"
+    a=${a//[[:space:]]/}
+    a=${a:-$def}
+    "$valid" "$a" && { printf '%s\n' "$a"; return; }
+    printf '            %s✗ "%s" is not a valid %s version%s\n' "$RED" "$a" "$label" "$R" >&2
+  done
+}
+
+php_have() { pkg_installed "php$1-fpm"; }
+node_have() { node_bin "$1" >/dev/null 2>&1; }
+# "2" → "2.11.1": the release that phar actually is.
+composer_show() {
+  local out
+  out=$(php "$(composer_phar "$1")" --version --no-ansi 2>/dev/null | sed -nE 's/^Composer version ([^ ]+).*/\1/p' | head -n1)
+  printf '%s' "${out:-$1}"
+}
+
+composer_have() { [[ -f $(composer_phar "$1") ]]; }
+
+valid_node() { [[ $1 == none || $1 =~ ^v?[0-9]+(\.[0-9]+){0,2}$ || $1 =~ ^(lts/.+|node|stable)$ ]]; }
+
+# ---------------------------------------------------------------- commands
+
+SELF_DEST="$HOME/.local/bin/berth"
+
+plan_self() {
+  local src
+  src=$(readlink -f "${BASH_SOURCE[0]}")
+  [[ $src == "$(readlink -f "$SELF_DEST" 2>/dev/null)" ]] && return 0
+  cmp -s "$src" "$SELF_DEST" && return 0
+  plan_user "copy $src to $SELF_DEST" do_self_install "$src"
+}
+
+do_self_install() {
+  cmdlog "install -Dm755 $1 $SELF_DEST"
+  install -Dm755 "$1" "$SELF_DEST"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) warn "$HOME/.local/bin is not on your PATH; add it in ~/.zshrc" ;;
+  esac
+}
+
+cmd_install() {
+  parse_opts "$@"
+  preflight
+  title "Setting up berth"
+  plan_self
+  plan_base_tools
+  plan_ppa
+  plan_apache
+  plan_sites_root
+  plan_composer "$DEFAULT_COMPOSER"
+  plan_nvm
+  if run_plan; then success "berth is installed and this machine is ready"
+  else success "berth is installed and this machine is already set up"; fi
+  detail "Next: put a Laravel project in $SITES_ROOT, cd into it and run berth host"
+}
+
+cmd_install_php() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-${OPT_PHP:-}}
+  [[ -n $v ]] || die "usage: berth php:install <version> [--ext a,b]"
+  valid_php "$v" || die "PHP version must look like 8.3, got: $v"
+  local exts=()
+  mapfile -t exts < <(ext_list)
+  title "Installing PHP $v"
+  plan_base_tools
+  plan_php "$v" "${exts[@]}"
+  if run_plan; then success "PHP $v is ready"; else success "PHP $v is already installed"; fi
+  detail "FPM socket: $(pool_sock "$v")"
+}
+
+cmd_install_composer() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-${OPT_COMPOSER:-$DEFAULT_COMPOSER}}
+  valid_composer "$v" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $v"
+  title "Installing Composer $v"
+  plan_composer "$v"
+  if run_plan; then success "Composer $v is ready ($(composer_show "$v"))"
+  else success "Composer $v is already installed ($(composer_show "$v"))"; fi
+}
+
+cmd_install_node() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-${OPT_NODE:-}}
+  [[ -n $v ]] || die "usage: berth node:install <version>"
+  title "Installing Node $v"
+  plan_node "$v"
+  local done_msg="Node $v is ready"
+  run_plan || done_msg="Node $v is already installed"
+  local bin
+  bin=$(node_bin "$v" 2>/dev/null) && done_msg+=" ($(basename "$(dirname "$bin")"))"
+  success "$done_msg"
+}
+
+suggest_php() { # suggest_php <project> <constraint>
+  local cons=$2 installed=() avail=() m
+  # The default wins whenever composer.json allows it.
+  if [[ -z $cons || -n $(php_matching "$cons" "$DEFAULT_PHP") ]]; then
+    printf '%s\n' "$DEFAULT_PHP"
+    return
+  fi
+  mapfile -t installed < <(installed_php_versions)
+  if (( ${#installed[@]} )); then
+    m=$(php_matching "$cons" "${installed[@]}" | head -n1)
+    [[ -n $m ]] && { printf '%s\n' "$m"; return; }
+  fi
+  mapfile -t avail < <(available_php_versions)
+  if (( ${#avail[@]} )); then
+    m=$(php_matching "$cons" "${avail[@]}" | head -n1)
+    [[ -n $m ]] && { printf '%s\n' "$m"; return; }
+  fi
+  printf '%s\n' "$DEFAULT_PHP"
+}
+
+# Composer 2.3+ needs PHP 7.2.5; older PHP gets the 2.2 LTS line.
+suggest_composer() {
+  if ver_ge "$1" 7.3; then printf '%s\n' "$DEFAULT_COMPOSER"; else printf '2.2\n'; fi
+}
+
+cmd_host() {
+  parse_opts "$@"
+  preflight
+  local path=${ARGS[0]:-$PWD}
+  [[ -d $path ]] || die "no such directory: $path"
+  path=$(cd "$path" && pwd -P)
+  [[ -f $path/public/index.php ]] || die "$path/public/index.php not found; is this a Laravel project?"
+  if in_home "$path"; then
+    die "$path is inside your home folder, which Apache can't enter.
+       Move the project under $SITES_ROOT, e.g.:
+         mv $path $SITES_ROOT/ && cd $SITES_ROOT/$(basename "$path") && berth host
+       (berth install creates $SITES_ROOT.)"
+  fi
+
+  local existing old_name= old_php= old_node=
+  existing=$(config_get path "$path")
+  local old_composer=
+  [[ -n $existing ]] && IFS=$'\t' read -r old_name _ old_php old_node old_composer <<<"$existing"
+
+  # name
+  local name
+  if [[ -n $OPT_NAME ]]; then name=$(sanitize_name "$OPT_NAME")
+  elif [[ -n $old_name ]]; then name=$old_name
+  else name=$(sanitize_name "$(basename "$path")")
+  fi
+  [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "invalid site name: '$name' (use --name)"
+  local clash
+  clash=$(config_get name "$name")
+  if [[ -n $clash ]]; then
+    local clash_path
+    clash_path=$(cut -f2 <<<"$clash")
+    [[ $clash_path == "$path" ]] || die "site '$name' already points to $clash_path; pick another with --name"
+  fi
+
+  # composer.json hints
+  local info_lines cons= exts=() line
+  info_lines=$(composer_info "$path")
+  while IFS=$'\t' read -r k val; do
+    [[ $k == php ]] && cons=$val
+    [[ $k == ext ]] && exts+=("$val")
+  done <<<"$info_lines"
+  while IFS= read -r line; do [[ -n $line ]] && exts+=("$line"); done < <(ext_list)
+
+  # Versions: a flag skips the question. Otherwise ask; Enter takes the suggestion, which is
+  # the site's current value when it's already hosted, else the default (PHP 8.5, Node 26, Composer 2).
+  # The PHP/Composer defaults give way only when they can't work (composer.json rules out 8.5,
+  # or the PHP is too old for Composer 2.3+).
+  local asking=0
+  (( ! YES )) && [[ -r /dev/tty ]] && [[ -z $OPT_PHP || -z $OPT_NODE || -z $OPT_COMPOSER ]] && asking=1
+  if [[ -n $old_name ]]; then
+    local oc=${old_composer:--}
+    title "Reconfiguring $name"
+    hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$DEFAULT_COMPOSER}"
+    (( asking )) && printf '\n  %sEnter keeps the current version; type to change it.%s\n\n' "$D" "$R"
+  else
+    title "Hosting $name"
+    hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    (( asking )) && printf '\n  %sEnter keeps the suggested version; type to change it.%s\n\n' "$D" "$R"
+  fi
+
+  local php=$OPT_PHP
+  if [[ -z $php ]]; then
+    local pdef=${old_php:-$(suggest_php "$path" "$cons")}
+    php=$(ask PHP "$pdef" valid_php installed_php_versions php_have)
+  fi
+  valid_php "$php" || die "PHP version must look like 8.3, got: $php"
+  if [[ -n $cons ]] && [[ -z $(php_matching "$cons" "$php") ]]; then
+    warn "PHP $php does not satisfy composer.json's \"php\": \"$cons\""
+  fi
+
+  local node=$OPT_NODE
+  if [[ -z $node ]]; then
+    local ndef=${old_node:-$DEFAULT_NODE}
+    [[ $ndef == - ]] && ndef=none
+    node=$(ask Node "$ndef" valid_node installed_node_versions node_have)
+  fi
+  node=${node#v}
+  [[ $node == none || $node == - || -z $node ]] && node=-
+
+  local composer=$OPT_COMPOSER
+  if [[ -z $composer ]]; then
+    local cdef=${old_composer:-}
+    [[ -z $cdef || $cdef == - ]] && cdef=$(suggest_composer "$php")
+    composer=$(ask Composer "$cdef" valid_composer installed_composer_versions composer_have composer_show)
+  fi
+  valid_composer "$composer" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $composer"
+
+  # ---- plan
+  plan_base_tools
+  plan_php "$php" "${exts[@]}"
+  plan_apache
+  plan_sites_root
+  [[ $node != - ]] && plan_node "$node"
+  plan_composer "$composer"
+
+  acl_ok "$path" || plan_user "grant www-data read access to $path/public (ACLs, traversal on parent dirs)" do_acl "$path"
+
+  if [[ -n $old_name && $old_name != "$name" ]]; then
+    plan_root "remove old vhost berth-$old_name (renamed to $name)" do_vhost_remove "$old_name"
+    queue_apache_apply
+  fi
+
+  local vf vc
+  vf=$(vhost_file "$name")
+  vc=$(vhost_content "$name" "$path" "$php")
+  if [[ ! -f $vf || $(cat "$vf") != "$vc" ]] || ! vhost_enabled "$name"; then
+    plan_root "write and enable vhost $vf (http://$name.localhost → PHP $php)" do_vhost "$name" "$vc"
+    queue_apache_apply
+  fi
+
+  local want
+  want=$(printf '%s\t%s\t%s\t%s\t%s' "$name" "$path" "$php" "$node" "$composer")
+  [[ $existing == "$want" ]] || plan_user "record $name in $CONFIG" do_config_set "$name" "$path" "$php" "$node" "$composer"
+
+  local changed=1
+  run_plan || changed=0
+  local st
+  if st=$(storage_link_in_home "$path"); then
+    warn "public/storage points into your home ($st), so uploaded files will return 403.
+         Recreate it: rm $path/public/storage && berth php artisan storage:link"
+  fi
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "http://$name.localhost/" || true)
+  if [[ $code == 000 || $code == 5* ]]; then
+    failure "$name is set up, but http://$name.localhost answered HTTP $code"
+    detail "Site error log: /var/log/apache2/berth-$name-error.log"
+    detail "PHP log:        /var/log/php$php-fpm.log"
+    detail "Laravel log:    $path/storage/logs/laravel.log"
+    return 1
+  fi
+  if (( ! changed )); then success "$name is unchanged and live at http://$name.localhost"
+  elif [[ -n $old_name ]]; then success "$name is reconfigured and live at http://$name.localhost"
+  else success "$name is live at http://$name.localhost"; fi
+  detail "PHP $php · Node ${node/-/none} · Composer $composer"
+  detail "Set APP_URL=http://$name.localhost in .env"
+  detail "Run tools with these versions: berth php artisan …, berth composer …, berth npm …"
+}
+
+cmd_rm() {
+  parse_opts "$@"
+  preflight
+  local name=${ARGS[0]:-}
+  [[ -n $name ]] || die "usage: berth rm <name>"
+  local line
+  line=$(config_get name "$name")
+  [[ -n $line || -f $(vhost_file "$name") ]] || die "no site named $name (see berth sites)"
+  title "Removing $name"
+  if [[ -f $(vhost_file "$name") ]] || vhost_enabled "$name"; then
+    plan_root "disable and delete vhost berth-$name" do_vhost_remove "$name"
+    queue_apache_apply
+  fi
+  [[ -n $line ]] && plan_user "remove $name from $CONFIG" do_config_del "$name"
+  run_plan || true
+  success "Removed $name; http://$name.localhost no longer serves it"
+}
+
+cmd_sites() {
+  local lines
+  lines=$(config_lines)
+  if [[ -z $lines ]]; then
+    info "No sites yet. Put a Laravel project in $SITES_ROOT, cd into it and run berth host."
+    return 0
+  fi
+  {
+    printf 'NAME\tURL\tPHP\tNODE\tCOMPOSER\tPATH\n'
+    while IFS=$'\t' read -r n p v nd c; do
+      local mark=
+      [[ -d $p ]] || mark=' (missing)'
+      c=${c:--}
+      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$DEFAULT_COMPOSER}" "$p" "$mark"
+    done <<<"$lines"
+  } | column -t -s $'\t'
+}
+
+cmd_doctor() {
+  local fails=0 code
+  section "Apache"
+  if systemctl is-active --quiet apache2; then ok "apache2 is active"; else bad "apache2 is not active"; fails=$((fails + 1)); fi
+  local srv
+  srv=$(curl -sI --max-time 5 http://localhost/ 2>/dev/null | awk -F': ' 'tolower($1)=="server" {print $2}' | tr -d '\r')
+  if [[ $srv == Apache* ]]; then ok "port 80 is served by Apache ($srv)"; else bad "port 80 is not answered by Apache (Server: ${srv:-none})"; fails=$((fails + 1)); fi
+  if [[ -z $(ss -ltnH 'sport = :443' 2>/dev/null) ]]; then ok "port 443 is free"; else warn "something listens on port 443"; fi
+  local m
+  for m in "${APACHE_MODS[@]}"; do
+    [[ -e /etc/apache2/mods-enabled/$m.load ]] && ok "mod $m enabled" || { bad "mod $m not enabled (berth install)"; fails=$((fails + 1)); }
+  done
+  if sudo -n true 2>/dev/null; then
+    if configtest; then ok "apache2ctl configtest passes"; else bad "apache2ctl configtest fails"; fails=$((fails + 1)); fi
+  fi
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost/phpmyadmin/ || true)
+  [[ $code == 200 ]] && ok "phpMyAdmin answers 200" || warn "http://localhost/phpmyadmin/ answered $code"
+
+  section "Sites"
+  local lines
+  lines=$(config_lines)
+  [[ -z $lines ]] && printf '  (none)\n'
+  local versions=()
+  while IFS=$'\t' read -r n p v nd c; do
+    [[ -z ${n:-} ]] && continue
+    c=${c:--}
+    c=${c/#-/$DEFAULT_COMPOSER}
+    versions+=("$v")
+    local probs=()
+    [[ -f $p/public/index.php ]] || probs+=("path $p/public/index.php missing")
+    if [[ -f $p/public/index.php ]]; then
+      if sudo -n true 2>/dev/null; then
+        sudo -u www-data test -r "$p/public/index.php" || probs+=("www-data cannot read public/index.php (re-run berth host)")
+      else
+        acl_ok "$p" || probs+=("www-data cannot read public/ (re-run berth host)")
+      fi
+    fi
+    storage_link_in_home "$p" >/dev/null && probs+=("public/storage points into your home; recreate it with storage:link")
+    in_home "$p" && probs+=("path is inside your home; move it under $SITES_ROOT")
+    vhost_enabled "$n" || probs+=("vhost not enabled")
+    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v")" ]] || probs+=("vhost out of sync with config (re-run berth host)")
+    [[ -S $(pool_sock "$v") ]] || probs+=("$(pool_sock "$v") missing (berth php:install $v)")
+    [[ $nd == - ]] || node_bin "$nd" >/dev/null 2>&1 || probs+=("Node $nd not installed (berth node:install $nd)")
+    [[ -f $(composer_phar "$c") ]] || probs+=("Composer $c not installed (berth composer:install $c)")
+    if (( ${#probs[@]} )); then
+      bad "$n"
+      printf '      %s\n' "${probs[@]}"
+      fails=$((fails + 1))
+    else
+      ok "$n (PHP $v, Node ${nd/-/none}, Composer $c) → $p"
+    fi
+  done <<<"$lines"
+
+  section "PHP-FPM berth pools"
+  local v
+  for v in $(printf '%s\n' "${versions[@]}" $(installed_php_versions) | sort -uV); do
+    [[ -z $v ]] && continue
+    if [[ -S $(pool_sock "$v") ]]; then ok "PHP $v: $(pool_sock "$v")"; else printf '  %s-%s PHP %s: no berth pool\n' "$D" "$R" "$v"; fi
+  done
+  if (( fails == 0 )); then success "Everything looks good"; else failure "$fails problem(s) found; fixes are listed above"; return 1; fi
+}
+
+# --- CLI pass-throughs: use the hosted project's versions, else system defaults
+
+project_php() {
+  local line
+  line=$(current_project) || return 1
+  cut -f3 <<<"$line"
+}
+
+project_node() {
+  local line
+  line=$(current_project) || return 1
+  cut -f4 <<<"$line"
+}
+
+cmd_php() {
+  local v
+  if v=$(project_php) && [[ -n $v ]]; then
+    command -v "php$v" >/dev/null || die "php$v is not installed (berth php:install $v)"
+    exec "php$v" "$@"
+  fi
+  exec php "$@"
+}
+
+project_composer() {
+  local line
+  line=$(current_project) || return 1
+  cut -f5 <<<"$line"
+}
+
+# Project's PHP + project's Composer. Outside a site: system php + berth's default Composer.
+# Falls back to a system composer only when berth has no copy of the default version.
+cmd_composer() {
+  local v= c= phar php=php
+  if v=$(project_php) && [[ -n $v ]]; then
+    command -v "php$v" >/dev/null || die "php$v is not installed (berth php:install $v)"
+    php="php$v"
+    c=$(project_composer) || c=
+  fi
+  [[ -z $c || $c == - ]] && c=$DEFAULT_COMPOSER
+  phar=$(composer_phar "$c")
+  if [[ ! -f $phar ]]; then
+    [[ $c == "$DEFAULT_COMPOSER" ]] && command -v composer >/dev/null \
+      && exec "$php" "$(command -v composer)" "$@"
+    die "Composer $c is not installed (berth composer:install $c)"
+  fi
+  exec "$php" "$phar" "$@"
+}
+
+cmd_node_tool() {
+  local tool=$1 spec bin
+  shift
+  spec=$(project_node 2>/dev/null) || spec=
+  [[ -z $spec || $spec == - ]] && spec=default
+  if bin=$(node_bin "$spec" 2>/dev/null) && [[ -n $bin ]]; then
+    PATH="$bin:$PATH" exec "$bin/$tool" "$@"
+  fi
+  [[ $spec != default ]] && die "Node $spec is not installed (berth node:install $spec)"
+  exec "$tool" "$@"
+}
+
+banner() {
+  printf '\n'
+  printf '  %s┏┓ ┏━╸┏━┓╺┳╸╻ ╻%s\n' "$CYN$B" "$R"
+  printf '  %s┣┻┓┣╸ ┣┳┛ ┃ ┣━┫%s   %slocal Laravel sites%s %sv%s%s\n' "$CYN$B" "$R" "$B" "$R" "$D" "$BERTH_VERSION" "$R"
+  printf '  %s┗━┛┗━╸╹┗╸ ╹ ╹ ╹%s   %sApache · PHP-FPM · Node · Composer%s\n' "$CYN$B" "$R" "$D" "$R"
+  printf '  %s≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈%s\n\n' "$CYN" "$R"
+}
+
+usage() {
+  banner
+  cat <<EOF
+Setup
+  berth install                       install berth to ~/.local/bin + PPA, Apache modules, nvm
+  berth php:install <v> [--ext a,b]   PHP <v> FPM + CLI + extensions + berth pool
+  berth node:install <v>              nvm install <v>
+  berth composer:install [v]          download Composer v (2, 2.2, 1 or x.y.z; default 2)
+
+Sites
+  berth host [path] [--name n] [--php v] [--node v|none] [--composer v] [--ext a,b]
+                                      serve a project (or reconfigure it) at http://<name>.localhost
+  berth sites                         list sites
+  berth rm <name>                     remove a site
+  berth doctor                        health checks
+
+Run with the project's versions (system defaults outside a hosted project)
+  berth php … | composer … | node … | npm … | npx …
+
+Options for setup/host/rm: --yes (take the suggested versions without asking), --dry-run (list what would be done)
+Config: $CONFIG
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  (( $# )) && shift
+  # Setup and configuration commands open with the banner; pass-throughs and listings stay plain.
+  case $cmd in
+    install|php:install|node:install|composer:install|host|rm|remove) banner ;;
+  esac
+  case $cmd in
+    php) cmd_php "$@" ;;
+    composer) cmd_composer "$@" ;;
+    node|npm|npx) cmd_node_tool "$cmd" "$@" ;;
+    install) cmd_install "$@" ;;
+    php:install) cmd_install_php "$@" ;;
+    node:install) cmd_install_node "$@" ;;
+    composer:install) cmd_install_composer "$@" ;;
+    host) cmd_host "$@" ;;
+    sites|list|ls) cmd_sites ;;
+    rm|remove) cmd_rm "$@" ;;
+    doctor) cmd_doctor ;;
+    version|--version|-v) echo "berth $BERTH_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (see berth help)" ;;
+  esac
+}
+
+main "$@"
