@@ -52,13 +52,25 @@ $ cd /srv/sites/shop && berth host
 
 ## Install
 
-```
-git clone <this repo> ~/playground/berth
-cd ~/playground/berth
-./berth install
+```bash
+curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/main/berth | bash -s -- install
 ```
 
-`berth install` copies the script to `~/.local/bin/berth`, which must be on your `PATH`. It then prepares the machine:
+To read the script before running it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/sajidifti/berth/main/berth
+less berth
+bash berth install
+```
+
+Or from a clone:
+
+```bash
+git clone https://github.com/sajidifti/berth.git && cd berth && ./berth install
+```
+
+`berth install` puts the script at `~/.local/bin/berth`, which must be on your `PATH`. It then prepares the machine:
 
 - the ondrej/php PPA
 - Apache with `mpm_event`, `proxy_fcgi`, `setenvif` and `rewrite` (any `mod_php` is disabled)
@@ -66,7 +78,11 @@ cd ~/playground/berth
 - Composer 2
 - nvm (`v0.41.0`)
 
-Each step is skipped if it's already done. Run `./berth install` again after editing the source to update the installed copy.
+Each step is skipped if it's already done, so running the install again updates berth and changes nothing else. To install a specific release instead of `main`, use the tag in the URL and in `BERTH_REF`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.1.0/berth | BERTH_REF=v0.1.0 bash -s -- install
+```
 
 ## Quick start
 
@@ -179,3 +195,7 @@ rm -r ~/.local/bin/berth ~/.config/berth ~/.local/share/berth
 ```
 
 PHP, Apache, nvm, Node and `/srv/sites` stay installed. Remove them separately if you want to.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # berth — serve local Laravel projects as http://<name>.localhost with Apache + per-site PHP-FPM.
 # See README.md. Runs as the user; sudo wraps only the system steps.
+# License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
 
 BERTH_VERSION=0.1.0
 NVM_TAG=v0.41.0
+BERTH_REPO=sajidifti/berth
+BERTH_REF=${BERTH_REF:-main}   # branch or tag to install from when piped from curl
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/berth"
 CONFIG="$CONFIG_DIR/sites"
 NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
@@ -740,12 +743,31 @@ valid_node() { [[ $1 == none || $1 =~ ^v?[0-9]+(\.[0-9]+){0,2}$ || $1 =~ ^(lts/.
 
 SELF_DEST="$HOME/.local/bin/berth"
 
+berth_url() { printf 'https://raw.githubusercontent.com/%s/%s/berth' "$BERTH_REPO" "$BERTH_REF"; }
+
 plan_self() {
-  local src
-  src=$(readlink -f "${BASH_SOURCE[0]}")
+  local src=${BASH_SOURCE[0]:-}
+  # Piped from curl: there is no file to copy, so download the script.
+  if [[ -z $src || ! -f $src ]]; then
+    plan_user "download berth ($BERTH_REF) to $SELF_DEST" do_self_download
+    return 0
+  fi
+  src=$(readlink -f "$src")
   [[ $src == "$(readlink -f "$SELF_DEST" 2>/dev/null)" ]] && return 0
   cmp -s "$src" "$SELF_DEST" && return 0
   plan_user "copy $src to $SELF_DEST" do_self_install "$src"
+}
+
+do_self_download() {
+  local tmp url
+  url=$(berth_url)
+  tmp=$(mktemp)
+  cmdlog "curl -fsSL $url"
+  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; die "could not download $url"; }
+  head -n1 "$tmp" | grep -q '^#!.*bash' && grep -q '^BERTH_VERSION=' "$tmp" \
+    || { rm -f "$tmp"; die "$url does not look like the berth script"; }
+  do_self_install "$tmp"
+  rm -f "$tmp"
 }
 
 do_self_install() {
@@ -1172,7 +1194,11 @@ main() {
   (( $# )) && shift
   # Setup and configuration commands open with the banner; pass-throughs and listings stay plain.
   case $cmd in
-    install|php:install|node:install|composer:install|host|rm|remove) banner ;;
+    install|php:install|node:install|composer:install|host|rm|remove)
+      banner
+      # When the script itself arrives on stdin (curl | bash), keep apt, nvm & co from reading it.
+      [[ -z ${BASH_SOURCE[0]:-} || ! -f ${BASH_SOURCE[0]:-} ]] && exec </dev/null
+      ;;
   esac
   case $cmd in
     php) cmd_php "$@" ;;
