@@ -4,7 +4,7 @@
 # License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
 
-BERTH_VERSION=0.2.0
+BERTH_VERSION=0.3.0
 NVM_TAG=v0.41.0
 BERTH_REPO=sajidifti/berth
 BERTH_REF=${BERTH_REF:-main}   # branch or tag to install from when piped from curl

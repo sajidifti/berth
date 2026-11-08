@@ -15,7 +15,7 @@ berth is a single bash script. It installs what a site needs (the ondrej PHP PPA
 $ cd /srv/sites/shop && berth site:host
 
   ┏┓ ┏━╸┏━┓╺┳╸╻ ╻
-  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.2.0
+  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.3.0
   ┗━┛┗━╸╹┗╸ ╹ ╹ ╹   Apache · PHP-FPM · Node · Composer
   ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
 
@@ -84,14 +84,14 @@ git clone https://github.com/sajidifti/berth.git && cd berth && ./berth install
 Each step is skipped if it's already done, so running `berth install` again only repairs what's missing. To install a specific release instead of `main`, use the tag in the URL and in `BERTH_REF`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.2.0/berth | BERTH_REF=v0.2.0 bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.3.0/berth | BERTH_REF=v0.3.0 bash -s -- install
 ```
 
 ### Update
 
 ```bash
 berth update                  # latest main
-berth update --ref v0.2.0     # a specific release
+berth update --ref v0.3.0     # a specific release
 ```
 
 `berth update` downloads berth from GitHub and replaces `~/.local/bin/berth`, showing the old and new version. It changes nothing else.
