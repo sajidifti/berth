@@ -9,7 +9,7 @@
 
 Serve local Laravel and plain PHP projects at `http://<name>.localhost` with Apache and PHP-FPM, choosing the PHP, Node and Composer version for each site.
 
-berth is a single bash script. It installs what a site needs (the ondrej PHP PPA, PHP versions and extensions, Apache modules, nvm, Node and Composer), so one `berth site:host` can take a bare Ubuntu WSL distro to a working site.
+berth is a single bash script. It installs what a site needs (the ondrej PHP PPA, PHP versions and extensions, Apache modules, nvm, Node and Composer), so one `berth site:host` can take a bare Ubuntu machine or WSL distro to a working site.
 
 ```
 $ cd /srv/sites/shop && berth site:host
@@ -31,6 +31,8 @@ $ cd /srv/sites/shop && berth site:host
             > 26
   Composer  installed  2.11.1
             > 2
+  HTTPS     also serve https://shop.localhost?
+            > [y/N]
 
   [1/3] write and enable vhost /etc/apache2/sites-available/berth-shop.conf (http://shop.localhost → PHP 8.5)
       + sudo tee /etc/apache2/sites-available/berth-shop.conf
@@ -99,7 +101,7 @@ berth update --ref v0.2.0     # a specific release
 ```
 mv ~/projects/shop /srv/sites/       # or: git clone … /srv/sites/shop
 cd /srv/sites/shop
-berth site:host                      # answer or press Enter three times
+berth site:host                      # press Enter to take each suggestion
 berth php artisan migrate            # runs with the site's PHP
 berth npm run dev                    # runs with the site's Node
 ```
@@ -121,6 +123,29 @@ cd /srv/sites/blog && berth site:host    # → http://blog.localhost
 
 Use `--root <folder>` to serve some other folder, for example `berth site:host --root dist`. The folder must be inside the project. `.htaccess` files work as usual. When the project folder itself is the web root, berth blocks web access to `.git`, `.svn`, `.hg` and `.env*`.
 
+### HTTPS
+
+`berth site:host` asks whether to also serve the site over HTTPS. The answer defaults to no. Pressing `y` gives you `https://<name>.localhost`, and `http://` keeps working alongside it.
+
+To switch later, run `berth site:host` in the project again and answer the question, where Enter keeps the current state. `--ssl` and `--no-ssl` skip the question.
+
+The first time HTTPS is turned on, berth creates one local certificate authority (CA) and adds it to every certificate store it finds on the machine:
+
+| Store | Used by | Needs |
+| --- | --- | --- |
+| Ubuntu's certificate store | `curl`, PHP, git | sudo |
+| Browser databases in your home folder | Chrome, Chromium and Firefox on Ubuntu, snaps included | nothing |
+| Your Windows user's store (WSL only) | Chrome and Edge on Windows | one Windows Yes/No prompt, no admin rights |
+
+Other details:
+
+- The CA can only sign names under `.localhost`, so it can't be used to impersonate a real domain. Its key is at `~/.local/share/berth/ssl/ca.key`, readable only by you.
+- Installed a browser after setting up HTTPS? Run `berth ssl:install` again and it fills in what's missing.
+- Firefox on Windows may keep its own list. If it warns about the certificate, import `ca.crt` under Settings > Certificates > Authorities.
+- Node doesn't read Ubuntu's certificate store. For a Node script that calls these URLs, set `NODE_EXTRA_CA_CERTS=~/.local/share/berth/ssl/ca.crt`.
+- Site certificates last 825 days. Running `berth site:host` renews one that has under 30 days left, and `berth doctor` reports it.
+- berth never edits `.env`. After turning HTTPS on or off, update `APP_URL` yourself.
+
 ## Commands
 
 Every command follows one of three patterns:
@@ -131,7 +156,7 @@ Every command follows one of three patterns:
 | `berth <thing>:<action>` | sites and versions berth manages | `site:host`, `php:install`, `node:list` |
 | `berth <tool> …` | running a tool with the site's versions | `berth php artisan migrate`, `berth npm run dev` |
 
-Sites use `host`, `list` and `remove`; PHP, Node and Composer use `install`, `list`, `update` and `remove`.
+Sites use `host`, `list` and `remove`; PHP, Node and Composer use `install`, `list`, `update`, `default` and `remove`; HTTPS uses `install`, `list` and `remove`.
 
 ### berth
 
@@ -160,6 +185,15 @@ Sites use `host`, `list` and `remove`; PHP, Node and Composer use `install`, `li
 | `--name shop` | Site name. Default: the folder name. The URL is `http://<name>.localhost` |
 | `--root web` | Folder to serve, relative to the project (`.` for the project folder). Default: detected; see [Plain PHP apps](#plain-php-apps) |
 | `--ext redis,imagick` | Extra PHP extensions |
+| `--ssl` / `--no-ssl` | Turn HTTPS on or off (skips the question). See [HTTPS](#https) |
+
+### HTTPS commands
+
+| Command | What it does |
+| --- | --- |
+| `berth ssl:install` | Create the local CA if needed and add it to any store that's missing it. `site:host` does this for you the first time |
+| `berth ssl:list` | Where the CA is trusted, and each HTTPS site's certificate expiry |
+| `berth ssl:remove` | Remove the CA from every store and delete it. Refused while any site uses HTTPS |
 
 ### PHP, Node and Composer
 
@@ -207,7 +241,7 @@ Watch the colon: `berth composer:update` updates Composer itself, while `berth c
 ### Options for every changing command
 
 - `--dry-run` lists what would be done and changes nothing.
-- `--yes` skips the version questions and takes the suggested answers.
+- `--yes` skips the questions and takes the suggested answers. For HTTPS, that's off for a new site and the current state for an existing one.
 
 ## Versions
 
@@ -253,9 +287,9 @@ Every changing command first checks the current state and runs only the missing 
 
 **PHP-FPM:** each PHP version gets a pool called `berth`, at `/etc/php/<v>/fpm/pool.d/berth.conf`. It runs as **your user** and listens on `/run/php/php<v>-berth.sock`. Laravel's `storage/` and `bootstrap/cache/` are written as you, so files created by artisan and by the web server never conflict.
 
-**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot` set to the web root (`<project>/public` for Laravel), `AllowOverride All` so `.htaccess` files work, and PHP handed to that version's berth socket. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
+**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot` set to the web root (`<project>/public` for Laravel), `AllowOverride All` so `.htaccess` files work, and PHP handed to that version's berth socket. A site with HTTPS gets a second, matching vhost on port 443, with its certificate in `/etc/apache2/berth-ssl/`. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
 
-**Registry:** `~/.config/berth/sites`, one line per site, tab-separated: `name  path  php  node  composer  root`. Vhosts are generated from it, so don't edit the vhost files by hand; re-run `berth site:host` instead.
+**Registry:** `~/.config/berth/sites`, one line per site, tab-separated: `name  path  php  node  composer  root  ssl`. Vhosts are generated from it, so don't edit the vhost files by hand; re-run `berth site:host` instead.
 
 ### Permissions
 
@@ -275,12 +309,14 @@ Start with `berth doctor`. It lists each problem with the command that fixes it.
   A fresh Laravel app also needs a reachable database if it uses database sessions or cache.
 - **Uploaded files return 403 after moving a project.** `public/storage` is an absolute symlink that still points into your home. Recreate it: `rm public/storage && berth php artisan storage:link`.
 - **`mkdir` in `/srv` is denied.** That's normal: `/srv` belongs to root. Use `/srv/sites`, which `berth install` creates for you.
+- **The browser warns about the HTTPS certificate.** Run `berth ssl:list` to see where the CA is missing, then `berth ssl:install`, and restart the browser. If Windows didn't add the CA, you may have declined its prompt (it can open behind the terminal), or your organisation may block new root certificates.
 - **Protect secrets.** Project `.env` files are usually `644`. `chmod 600 .env` keeps them readable by you (and therefore by PHP), but not by `www-data`.
 
 ## Uninstall
 
 ```
 berth site:remove <name>              # for each site in `berth site:list`
+berth ssl:remove                      # if you used HTTPS
 sudo rm /etc/php/*/fpm/pool.d/berth.conf && sudo systemctl restart 'php*-fpm'
 rm -r ~/.local/bin/berth ~/.config/berth ~/.local/share/berth
 ```

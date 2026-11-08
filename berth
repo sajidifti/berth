@@ -21,6 +21,12 @@ BASE_PKGS=(cli fpm common mysql mbstring xml curl zip gd intl bcmath)
 APACHE_MODS=(mpm_event proxy_fcgi setenvif rewrite)
 VHOST_DIR=/etc/apache2/sites-available
 SITES_ROOT=/srv/sites
+CA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/berth/ssl"
+CA_KEY="$CA_DIR/ca.key"
+CA_CRT="$CA_DIR/ca.crt"
+CA_NICK="berth local CA"
+SYS_CA=/usr/local/share/ca-certificates/berth-local-ca.crt
+SSL_DIR=/etc/apache2/berth-ssl
 ME=$(id -un)
 MYGROUP=$(id -gn)
 
@@ -227,8 +233,8 @@ installed_composer_versions() {
 
 config_lines() { [[ -f $CONFIG ]] && grep -v '^\s*\(#\|$\)' "$CONFIG" || true; }
 
-# config_get <field:name|path> <value> → "name<TAB>path<TAB>php<TAB>node<TAB>composer<TAB>root"
-# (lines written before web roots existed have no root column and mean "public")
+# config_get <field:name|path> <value> → "name<TAB>path<TAB>php<TAB>node<TAB>composer<TAB>root<TAB>ssl"
+# (older lines have no root column, meaning "public", and no ssl column, meaning off; ssl is "ssl" or "-")
 config_get() {
   local col=1
   [[ $1 == path ]] && col=2
@@ -236,11 +242,11 @@ config_get() {
 }
 
 config_set() {
-  local name=$1 path=$2 php=$3 node=$4 composer=${5:--} root=${6:-public} tmp
+  local name=$1 path=$2 php=$3 node=$4 composer=${5:--} root=${6:-public} ssl=${7:--} tmp
   mkdir -p "$CONFIG_DIR"
   tmp=$(mktemp "$CONFIG_DIR/.sites.XXXXXX")
   config_lines | awk -F'\t' -v n="$name" -v p="$path" '$1 != n && $2 != p' >"$tmp"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$node" "$composer" "$root" >>"$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$node" "$composer" "$root" "$ssl" >>"$tmp"
   sort -o "$tmp" "$tmp"
   mv "$tmp" "$CONFIG"
   cmdlog "updated $CONFIG ($name)"
@@ -406,12 +412,13 @@ EOF
 vhost_file() { printf '%s/berth-%s.conf' "$VHOST_DIR" "$1"; }
 vhost_enabled() { [[ -e /etc/apache2/sites-enabled/berth-$1.conf ]]; }
 
-vhost_content() { # vhost_content <name> <project> <php> [root]
-  local name=$1 path=$2 php=$3 root=${4:-public} doc
-  doc=$(site_docroot "$path" "$root")
+site_cert() { printf '%s/%s.crt' "$SSL_DIR" "$1"; }
+site_key() { printf '%s/%s.key' "$SSL_DIR" "$1"; }
+
+vhost_block() { # vhost_block <port> <name> <webroot> <root> <php>
+  local port=$1 name=$2 doc=$3 root=$4 php=$5
   cat <<EOF
-# Managed by berth. Changes are overwritten by \`berth site:host\`.
-<VirtualHost *:80>
+<VirtualHost *:$port>
     ServerName $name.localhost
     ServerAlias *.$name.localhost
     DocumentRoot "$doc"
@@ -432,6 +439,12 @@ EOF
         Require all denied
     </FilesMatch>
 EOF
+  [[ $port == 443 ]] && cat <<EOF
+
+    SSLEngine on
+    SSLCertificateFile $(site_cert "$name")
+    SSLCertificateKeyFile $(site_key "$name")
+EOF
   cat <<EOF
 
     <FilesMatch "\.php$">
@@ -442,6 +455,17 @@ EOF
     CustomLog \${APACHE_LOG_DIR}/berth-$name-access.log combined
 </VirtualHost>
 EOF
+}
+
+vhost_content() { # vhost_content <name> <project> <php> [root] [ssl]
+  local name=$1 path=$2 php=$3 root=${4:-public} ssl=${5:--} doc
+  doc=$(site_docroot "$path" "$root")
+  printf '# Managed by berth. Changes are overwritten by `berth site:host`.\n'
+  vhost_block 80 "$name" "$doc" "$root" "$php"
+  if [[ $ssl == ssl ]]; then
+    printf '\n'
+    vhost_block 443 "$name" "$doc" "$root" "$php"
+  fi
 }
 
 # ---------------------------------------------------------------- plan / run engine
@@ -529,7 +553,7 @@ do_apache_mods() { # do_apache_mods "<to disable>" "<to enable>"
   # shellcheck disable=SC2086
   [[ -n $en ]] && sudo_run a2enmod -q $en
   APACHE_DIRTY=1
-  [[ $dis == *mpm_* || $en == *mpm_* ]] && APACHE_RESTART=1
+  [[ $dis == *mpm_* || $en == *mpm_* || $en == *ssl* ]] && APACHE_RESTART=1
   return 0
 }
 
@@ -723,7 +747,7 @@ preflight() {
 
 # ---------------------------------------------------------------- argument parsing
 
-OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER= OPT_ROOT= OPT_REF=
+OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER= OPT_ROOT= OPT_REF= OPT_SSL=
 ARGS=()
 parse_opts() {
   while (( $# )); do
@@ -740,6 +764,8 @@ parse_opts() {
       --ref=*) OPT_REF=${1#*=} ;;
       --root) OPT_ROOT=${2:?--root needs a folder}; shift ;;
       --root=*) OPT_ROOT=${1#*=} ;;
+      --ssl) OPT_SSL=on ;;
+      --no-ssl) OPT_SSL=off ;;
       --ext) OPT_EXT+=",${2:?--ext needs a list}"; shift ;;
       --ext=*) OPT_EXT+=",${1#*=}" ;;
       -y|--yes) YES=1 ;;
@@ -795,6 +821,25 @@ composer_show() {
 }
 
 composer_have() { [[ -f $(composer_phar "$1") ]]; }
+
+# HTTPS question: ask_ssl <y|n default> <site> → "ssl" or "-". Enter takes the default.
+# Not pre-filled like the version questions, so a single y or n is the whole answer.
+ask_ssl() {
+  local def=$1 name=$2 a=$1 hint='[y/N]'
+  [[ $def == y ]] && hint='[Y/n]'
+  if (( ! YES )) && [[ -r /dev/tty ]]; then
+    printf '  %s%-9s%s %salso serve https://%s.localhost?%s\n' "$B" "HTTPS" "$R" "$D" "$name" "$R" >&2
+    local prompt=$'\001'"$CYN$B"$'\002'"> "$'\001'"$R"$'\002'
+    while :; do
+      read -e -r -p "            $prompt$hint " a </dev/tty || die "aborted"
+      a=${a//[[:space:]]/}
+      a=${a:-$def}
+      [[ ${a,,} =~ ^(y|yes|n|no)$ ]] && break
+      printf '            %s✗ answer y or n%s\n' "$RED" "$R" >&2
+    done
+  fi
+  case ${a,,} in y*) printf 'ssl\n' ;; *) printf -- '-\n' ;; esac
+}
 
 valid_node() { [[ $1 == none || $1 =~ ^v?[0-9]+(\.[0-9]+){0,2}$ || $1 =~ ^(lts/.+|node|stable)$ ]]; }
 
@@ -887,6 +932,300 @@ cmd_install_node() {
   local bin
   bin=$(node_bin "$v" 2>/dev/null) && done_msg+=" ($(basename "$(dirname "$bin")"))"
   success "$done_msg"
+}
+
+# ---------------------------------------------------------------- HTTPS
+#
+# One local certificate authority per user signs one certificate per site. It is limited by a
+# name constraint to names under .localhost, so it cannot vouch for any real domain.
+# Trust is added wherever this machine has a store: Ubuntu's own store, the browser databases
+# of a desktop install, and, only under WSL, the Windows user's store.
+
+ca_exists() { [[ -f $CA_KEY && -f $CA_CRT ]]; }
+
+# SHA-1 thumbprint of the CA, or nothing if there is none yet.
+ca_fp() {
+  [[ -f $CA_CRT ]] || return 0
+  openssl x509 -in "$CA_CRT" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g'
+}
+
+cert_expiry() { date -d "$(openssl x509 -in "$1" -noout -enddate | sed 's/.*=//')" +%F; }
+
+# Issued by the current CA and good for at least 30 more days?
+site_cert_ok() {
+  local c
+  c=$(site_cert "$1")
+  [[ -f $c && -f $(site_key "$1") && -f $CA_CRT ]] || return 1
+  openssl verify -CAfile "$CA_CRT" "$c" >/dev/null 2>&1 || return 1
+  openssl x509 -in "$c" -noout -checkend 2592000 >/dev/null 2>&1
+}
+
+is_wsl() { [[ -n ${WSL_DISTRO_NAME:-} ]] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
+
+win_tool() { # win_tool <name.exe> <fallback path> → the path, or fails
+  local p
+  p=$(command -v "$1" 2>/dev/null) || p=$2
+  [[ -x $p ]] || return 1
+  printf '%s' "$p"
+}
+win_ps() { win_tool powershell.exe /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe; }
+win_certutil() { win_tool certutil.exe /mnt/c/Windows/System32/certutil.exe; }
+win_ready() { is_wsl && win_ps >/dev/null && win_certutil >/dev/null; }
+
+# certutil.exe's exit status doesn't say whether a certificate is present; ask the certificate drive.
+win_trusted() {
+  local ps
+  ps=$(win_ps) || return 1
+  timeout 30 "$ps" -NoProfile -Command "if (Test-Path 'Cert:\\CurrentUser\\Root\\$1') { exit 0 } else { exit 1 }" </dev/null >/dev/null 2>&1
+}
+
+# Certificate databases of the browsers on this machine (Chrome/Chromium, Firefox, snaps included).
+nss_dbs() {
+  local d
+  for d in "$HOME/.pki/nssdb" "$HOME/snap/chromium/current/.pki/nssdb" \
+           "$HOME"/.mozilla/firefox/*/ "$HOME"/snap/firefox/common/.mozilla/firefox/*/; do
+    d=${d%/}
+    [[ -f $d/cert9.db ]] && printf '%s\n' "$d"
+  done
+  # Chrome creates this one on first run; make it now so a fresh install trusts the CA too.
+  if [[ ! -f $HOME/.pki/nssdb/cert9.db ]] && command -v google-chrome google-chrome-stable chromium chromium-browser >/dev/null 2>&1; then
+    printf '%s\n' "$HOME/.pki/nssdb"
+  fi
+  return 0
+}
+
+nss_trusted() { # nss_trusted <db> <thumbprint>
+  local got
+  command -v certutil >/dev/null || return 1
+  got=$(certutil -L -d "sql:$1" -n "$CA_NICK" -a 2>/dev/null | openssl x509 -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g') || true
+  [[ -n $got && $got == "$2" ]]
+}
+
+SSL_TRUST_PLANNED=0
+
+# Queue whatever is missing for this machine to trust the CA. Each store is checked on its own.
+plan_ssl_trust() {
+  local fp db dbs=()
+  fp=$(ca_fp)
+  if [[ -z $fp ]] || ! cmp -s "$CA_CRT" "$SYS_CA"; then
+    plan_root "add the CA to Ubuntu's certificate store (curl, PHP, git)" do_ca_system
+    SSL_TRUST_PLANNED=1
+  fi
+  mapfile -t dbs < <(nss_dbs)
+  if (( ${#dbs[@]} )) && ! command -v certutil >/dev/null; then
+    plan_root "install libnss3-tools (to reach the browser certificate databases)" do_apt_install libnss3-tools
+  fi
+  for db in "${dbs[@]}"; do
+    if [[ -z $fp ]] || ! nss_trusted "$db" "$fp"; then
+      plan_user "add the CA to the browser database $db" do_ca_nss "$db"
+      SSL_TRUST_PLANNED=1
+    fi
+  done
+  if is_wsl; then
+    if ! win_ready; then
+      warn "Windows tools can't be reached from WSL. To trust the CA in Windows, import $CA_CRT into Current User > Trusted Root Certification Authorities."
+    elif [[ -z $fp ]] || ! win_trusted "$fp"; then
+      plan_user "add the CA to your Windows user's certificate store (no admin needed; Windows asks you to confirm)" do_ca_windows
+      SSL_TRUST_PLANNED=1
+    fi
+  fi
+  return 0
+}
+
+plan_ssl_ca() {
+  local p missing=()
+  for p in openssl ca-certificates; do pkg_installed "$p" || missing+=("$p"); done
+  (( ${#missing[@]} )) && plan_root "install ${missing[*]}" do_apt_install "${missing[@]}"
+  ca_exists || plan_user "create berth's local certificate authority in $CA_DIR (valid only for .localhost names)" do_ca_create
+  plan_ssl_trust
+}
+
+plan_apache_ssl() {
+  [[ -e /etc/apache2/mods-enabled/ssl.load ]] && return 0
+  [[ -z $(ss -ltnH 'sport = :443' 2>/dev/null) ]] || die "something else is listening on port 443, so Apache can't serve HTTPS. Stop it and run this again."
+  plan_root "a2enmod ssl" do_apache_mods "" "ssl"
+  queue_apache_apply
+}
+
+do_ca_create() {
+  local cnf
+  cnf=$(mktemp)
+  cat >"$cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ca
+prompt = no
+[dn]
+O = berth
+CN = $CA_NICK ($ME@$(hostname -s))
+[ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+nameConstraints = critical,permitted;DNS:localhost
+EOF
+  cmdlog "openssl: new CA key and certificate in $CA_DIR"
+  ( umask 077
+    mkdir -p "$CA_DIR"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$CA_KEY" 2>/dev/null ) || die "could not create the CA key"
+  openssl req -x509 -new -key "$CA_KEY" -sha256 -days 3650 -config "$cnf" -out "$CA_CRT" || die "could not create the CA certificate"
+  rm -f "$cnf"
+}
+
+do_ca_system() {
+  sudo_run install -m 644 "$CA_CRT" "$SYS_CA"
+  sudo_run update-ca-certificates
+}
+
+do_ca_system_remove() {
+  sudo_run rm -f "$SYS_CA"
+  sudo_run update-ca-certificates
+}
+
+nss_delete() { while certutil -L -d "sql:$1" -n "$CA_NICK" >/dev/null 2>&1; do certutil -D -d "sql:$1" -n "$CA_NICK" || break; done; }
+
+do_ca_nss() {
+  local db=$1
+  if [[ ! -f $db/cert9.db ]]; then
+    mkdir -p "$db"
+    certutil -N -d "sql:$db" --empty-password || die "could not create $db"
+  fi
+  nss_delete "$db"
+  cmdlog "certutil -A -d sql:$db -n \"$CA_NICK\" -t C,,"
+  certutil -A -d "sql:$db" -n "$CA_NICK" -t C,, -i "$CA_CRT" || die "could not add the CA to $db"
+}
+
+do_ca_nss_remove() { cmdlog "certutil -D -d sql:$1 -n \"$CA_NICK\""; nss_delete "$1"; }
+
+# Declining the Windows prompt or a blocking policy isn't fatal: the site still works, with a browser warning.
+do_ca_windows() {
+  local cu fp
+  cu=$(win_certutil)
+  fp=$(ca_fp)
+  printf '      %sConfirm the Windows security prompt. It may open behind this window.%s\n' "$YEL" "$R"
+  cmdlog "certutil.exe -user -addstore Root $(wslpath -w "$CA_CRT")"
+  "$cu" -user -addstore Root "$(wslpath -w "$CA_CRT")" </dev/null >/dev/null 2>&1 || true
+  win_trusted "$fp" || warn "Windows did not add the CA, so browsers there will show a certificate warning. If you declined the prompt, run berth ssl:install to try again. If your organisation blocks this, ask your IT team."
+}
+
+do_ca_windows_remove() {
+  local cu
+  cu=$(win_certutil)
+  printf '      %sConfirm the Windows security prompt. It may open behind this window.%s\n' "$YEL" "$R"
+  cmdlog "certutil.exe -user -delstore Root $1"
+  "$cu" -user -delstore Root "$1" </dev/null >/dev/null 2>&1 || true
+  win_trusted "$1" && warn "Windows still has the CA. Remove \"$CA_NICK\" with certmgr.msc."
+  return 0
+}
+
+do_ca_delete() { cmdlog "rm $CA_KEY $CA_CRT"; rm -f "$CA_KEY" "$CA_CRT"; rmdir "$CA_DIR" 2>/dev/null || true; }
+
+do_site_cert() {
+  local name=$1 host=$1.localhost t
+  t=$(mktemp -d)
+  cat >"$t/ext" <<EOF
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+subjectAltName = DNS:$host,DNS:*.$host
+EOF
+  cmdlog "openssl: certificate for $host, signed by the local CA"
+  if ! { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$t/key" 2>/dev/null \
+      && openssl req -new -key "$t/key" -subj "/CN=$host" -out "$t/csr" \
+      && openssl x509 -req -in "$t/csr" -CA "$CA_CRT" -CAkey "$CA_KEY" -set_serial "0x$(openssl rand -hex 16)" \
+           -days 825 -sha256 -extfile "$t/ext" -out "$t/crt" 2>/dev/null; }; then
+    rm -rf "$t"
+    die "could not create the certificate for $host"
+  fi
+  sudo_run install -d -m 755 "$SSL_DIR"
+  sudo_run install -m 644 "$t/crt" "$(site_cert "$name")"
+  sudo_run install -m 600 "$t/key" "$(site_key "$name")"
+  rm -rf "$t"
+  APACHE_DIRTY=1
+}
+
+do_site_cert_remove() { sudo_run rm -f "$(site_cert "$1")" "$(site_key "$1")"; }
+
+# After trust was added: what the user still has to do.
+ssl_hints() {
+  (( SSL_TRUST_PLANNED )) || return 0
+  detail "Restart any open browser so it picks up the new certificate authority."
+  if is_wsl; then
+    detail "Firefox on Windows may keep its own list: import $(wslpath -w "$CA_CRT") under Settings > Certificates > Authorities."
+  fi
+  return 0
+}
+
+ssl_trust_report() {
+  local fp=$1 db
+  if cmp -s "$CA_CRT" "$SYS_CA"; then ok "Ubuntu's certificate store"; else bad "Ubuntu's certificate store (berth ssl:install)"; fi
+  while IFS= read -r db; do
+    [[ -n $db ]] || continue
+    if nss_trusted "$db" "$fp"; then ok "$db"; else bad "$db (berth ssl:install)"; fi
+  done < <(nss_dbs)
+  if is_wsl; then
+    if win_ready && win_trusted "$fp"; then ok "Windows, your user's store"; else bad "Windows, your user's store (berth ssl:install)"; fi
+  fi
+  return 0
+}
+
+cmd_ssl_install() {
+  parse_opts "$@"
+  preflight
+  title "Setting up HTTPS for .localhost sites"
+  plan_ssl_ca
+  if run_plan; then success "This machine trusts berth's certificate authority"
+  else success "This machine already trusts berth's certificate authority"; fi
+  detail "Turn HTTPS on for a site with berth site:host --ssl"
+  ssl_hints
+}
+
+cmd_ssl_list() {
+  if ! ca_exists; then
+    info "No certificate authority yet. Run berth ssl:install, or answer y to HTTPS in berth site:host."
+    return 0
+  fi
+  section "Certificate authority"
+  detail "$CA_CRT"
+  detail "expires $(cert_expiry "$CA_CRT")"
+  section "Trusted by"
+  ssl_trust_report "$(ca_fp)"
+  section "Sites using HTTPS"
+  local n found=0
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    found=1
+    if site_cert_ok "$n"; then ok "https://$n.localhost  expires $(cert_expiry "$(site_cert "$n")")"
+    else bad "https://$n.localhost  certificate missing or expiring (re-run berth site:host there)"; fi
+  done < <(sites_where 7 _is_ssl)
+  (( found )) || printf '  (none)\n'
+}
+
+_is_ssl() { [[ $1 == ssl ]]; }
+
+cmd_ssl_remove() {
+  parse_opts "$@"
+  preflight
+  local on=() fp db
+  mapfile -t on < <(sites_where 7 _is_ssl)
+  (( ${#on[@]} == 0 )) || die "HTTPS is on for $(join_list "${on[@]}").
+       Turn it off first (cd into each, then berth site:host --no-ssl) or remove the site (berth site:remove <name>)."
+  title "Removing berth's certificate authority"
+  fp=$(ca_fp)
+  if [[ -n $fp ]] && win_ready && win_trusted "$fp"; then
+    plan_user "remove the CA from your Windows user's store (Windows asks you to confirm)" do_ca_windows_remove "$fp"
+  fi
+  while IFS= read -r db; do
+    [[ -n $db && -n $fp ]] && nss_trusted "$db" "$fp" && plan_user "remove the CA from the browser database $db" do_ca_nss_remove "$db"
+  done < <(nss_dbs)
+  [[ -f $SYS_CA ]] && plan_root "remove the CA from Ubuntu's certificate store" do_ca_system_remove
+  [[ -f $CA_KEY || -f $CA_CRT ]] && plan_user "delete the CA in $CA_DIR" do_ca_delete
+  if (( ${#PLAN[@]} == 0 )); then success "There is no certificate authority to remove"; return 0; fi
+  if (( ! DRYRUN )) && ! confirm "Remove berth's certificate authority?"; then info "  Nothing was removed."; return 0; fi
+  run_plan || true
+  success "berth's certificate authority is gone"
 }
 
 # ---------------------------------------------------------------- version lists and removal
@@ -1569,9 +1908,10 @@ cmd_host() {
 
   local existing old_name= old_php= old_node=
   existing=$(config_get path "$path")
-  local old_composer= old_root=
-  [[ -n $existing ]] && IFS=$'\t' read -r old_name _ old_php old_node old_composer old_root <<<"$existing"
+  local old_composer= old_root= old_ssl=
+  [[ -n $existing ]] && IFS=$'\t' read -r old_name _ old_php old_node old_composer old_root old_ssl <<<"$existing"
   [[ -n $old_name && -z $old_root ]] && old_root=public
+  [[ -n $old_name && -z $old_ssl ]] && old_ssl=-
 
   # web root: --root, else the site's current one, else detected
   local root doc
@@ -1617,19 +1957,21 @@ cmd_host() {
   # The PHP/Composer defaults give way only when they can't work (composer.json rules out 8.5,
   # or the PHP is too old for Composer 2.3+).
   local asking=0
-  (( ! YES )) && [[ -r /dev/tty ]] && [[ -z $OPT_PHP || -z $OPT_NODE || -z $OPT_COMPOSER ]] && asking=1
+  (( ! YES )) && [[ -r /dev/tty ]] && [[ -z $OPT_PHP || -z $OPT_NODE || -z $OPT_COMPOSER || -z $OPT_SSL ]] && asking=1
   if [[ -n $old_name ]]; then
     local oc=${old_composer:--}
+    local old_url=http old_https=off
+    [[ $old_ssl == ssl ]] && old_url=https old_https=on
     title "Reconfiguring $name"
-    hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    hdetail "${CYN}$old_url://$name.localhost${R}  ${D}$path${R}"
     hdetail "${D}$kind · $serving${R}"
-    hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$FALLBACK_COMPOSER}"
-    (( asking )) && printf '\n  %sEnter keeps the current version; type to change it.%s\n\n' "$D" "$R"
+    hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$FALLBACK_COMPOSER} ${D}·${R} HTTPS $old_https"
+    (( asking )) && printf '\n  %sEnter keeps the current answer; type to change it.%s\n\n' "$D" "$R"
   else
     title "Hosting $name"
     hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
     hdetail "${D}$kind · $serving${R}"
-    (( asking )) && printf '\n  %sEnter keeps the suggested version; type to change it.%s\n\n' "$D" "$R"
+    (( asking )) && printf '\n  %sEnter keeps the suggested answer; type to change it.%s\n\n' "$D" "$R"
   fi
 
   local php=$OPT_PHP
@@ -1659,6 +2001,18 @@ cmd_host() {
   fi
   valid_composer "$composer" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $composer"
 
+  # HTTPS: a flag skips the question; Enter keeps the current state, which is off for a new site.
+  local ssl
+  case $OPT_SSL in
+    on) ssl=ssl ;;
+    off) ssl=- ;;
+    *)
+      local sdef=n
+      [[ $old_ssl == ssl ]] && sdef=y
+      ssl=$(ask_ssl "$sdef" "$name")
+      ;;
+  esac
+
   # ---- plan
   plan_base_tools
   plan_php "$php" "${exts[@]}"
@@ -1672,21 +2026,40 @@ cmd_host() {
   if [[ -n $old_name && $old_name != "$name" ]]; then
     plan_root "remove old vhost berth-$old_name (renamed to $name)" do_vhost_remove "$old_name"
     queue_apache_apply
+    [[ -f $(site_cert "$old_name") ]] && plan_root "delete the certificate of $old_name" do_site_cert_remove "$old_name"
   fi
 
-  local vf vc
+  # The certificate must exist before the vhost that names it passes Apache's config test.
+  if [[ $ssl == ssl ]]; then
+    if [[ $old_ssl != ssl ]] || ! ca_exists; then plan_ssl_ca; fi
+    plan_apache_ssl
+    if ! site_cert_ok "$name"; then
+      plan_root "issue a certificate for $name.localhost" do_site_cert "$name"
+      queue_apache_apply
+    fi
+  fi
+
+  local vf vc url=http://$name.localhost curl_ca=()
+  if [[ $ssl == ssl ]]; then
+    url=https://$name.localhost
+    curl_ca=(--cacert "$CA_CRT")
+  fi
   vf=$(vhost_file "$name")
-  vc=$(vhost_content "$name" "$path" "$php" "$root")
+  vc=$(vhost_content "$name" "$path" "$php" "$root" "$ssl")
   if [[ ! -f $vf || $(cat "$vf") != "$vc" ]] || ! vhost_enabled "$name"; then
-    plan_root "write and enable vhost $vf (http://$name.localhost → PHP $php)" do_vhost "$name" "$vc"
+    plan_root "write and enable vhost $vf ($url → PHP $php)" do_vhost "$name" "$vc"
     queue_apache_apply
   fi
+  if [[ $ssl != ssl && -f $(site_cert "$name") ]]; then
+    plan_root "delete the certificate of $name (HTTPS is off)" do_site_cert_remove "$name"
+  fi
 
-  local want
-  want=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$name" "$path" "$php" "$node" "$composer" "$root")
-  # A line from before web roots (no root column) is the same site when its root is public.
-  [[ $existing == "$want" || ( $root == public && "$existing"$'\tpublic' == "$want" ) ]] \
-    || plan_user "record $name in $CONFIG" do_config_set "$name" "$path" "$php" "$node" "$composer" "$root"
+  # Compare parsed values, so a line from before the root or ssl columns counts as the same site.
+  local want have=
+  want=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$name" "$path" "$php" "$node" "$composer" "$root" "$ssl")
+  [[ -n $old_name ]] && have=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$old_name" "$path" "$old_php" "$old_node" "$old_composer" "$old_root" "$old_ssl")
+  [[ $have == "$want" ]] \
+    || plan_user "record $name in $CONFIG" do_config_set "$name" "$path" "$php" "$node" "$composer" "$root" "$ssl"
 
   local changed=1
   run_plan || changed=0
@@ -1696,20 +2069,21 @@ cmd_host() {
          Recreate it: rm $doc/storage && berth php artisan storage:link"
   fi
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "http://$name.localhost/" || true)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${curl_ca[@]}" "$url/" || true)
   if [[ $code == 000 || $code == 5* ]]; then
-    failure "$name is set up, but http://$name.localhost answered HTTP $code"
+    failure "$name is set up, but $url answered HTTP $code"
     detail "Site error log: /var/log/apache2/berth-$name-error.log"
     detail "PHP log:        /var/log/php$php-fpm.log"
     is_laravel "$path" && detail "Laravel log:    $path/storage/logs/laravel.log"
     return 1
   fi
-  if (( ! changed )); then success "$name is unchanged and live at http://$name.localhost"
-  elif [[ -n $old_name ]]; then success "$name is reconfigured and live at http://$name.localhost"
-  else success "$name is live at http://$name.localhost"; fi
+  if (( ! changed )); then success "$name is unchanged and live at $url"
+  elif [[ -n $old_name ]]; then success "$name is reconfigured and live at $url"
+  else success "$name is live at $url"; fi
   detail "PHP $php · Node ${node/-/none} · Composer $composer"
+  ssl_hints
   if is_laravel "$path"; then
-    detail "Set APP_URL=http://$name.localhost in .env"
+    detail "Set APP_URL=$url in .env"
     detail "Run tools with these versions: berth php artisan …, berth composer …, berth npm …"
   else
     detail "Run tools with these versions: berth php …, berth composer …, berth npm …"
@@ -1729,6 +2103,7 @@ cmd_remove() {
     plan_root "disable and delete vhost berth-$name" do_vhost_remove "$name"
     queue_apache_apply
   fi
+  [[ -f $(site_cert "$name") ]] && plan_root "delete the certificate of $name" do_site_cert_remove "$name"
   [[ -n $line ]] && plan_user "remove $name from $CONFIG" do_config_del "$name"
   run_plan || true
   success "Removed $name; http://$name.localhost no longer serves it"
@@ -1743,12 +2118,13 @@ cmd_sites() {
   fi
   {
     printf 'NAME\tURL\tPHP\tNODE\tCOMPOSER\tPATH\tWEB ROOT\n'
-    while IFS=$'\t' read -r n p v nd c r; do
-      local mark=
+    while IFS=$'\t' read -r n p v nd c r s; do
+      local mark= scheme=http
       [[ -d $p ]] || mark=' (missing)'
       c=${c:--} r=${r:-public}
       [[ $r == . ]] && r=./ || r=$r/
-      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\t%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$FALLBACK_COMPOSER}" "$p" "$mark" "$r"
+      [[ ${s:-} == ssl ]] && scheme=https
+      printf '%s\t'"$scheme"'://%s.localhost\t%s\t%s\t%s\t%s%s\t%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$FALLBACK_COMPOSER}" "$p" "$mark" "$r"
     done <<<"$lines"
   } | column -t -s $'\t'
 }
@@ -1760,7 +2136,9 @@ cmd_doctor() {
   local srv
   srv=$(curl -sI --max-time 5 http://localhost/ 2>/dev/null | awk -F': ' 'tolower($1)=="server" {print $2}' | tr -d '\r')
   if [[ $srv == Apache* ]]; then ok "port 80 is served by Apache ($srv)"; else bad "port 80 is not answered by Apache (Server: ${srv:-none})"; fails=$((fails + 1)); fi
-  if [[ -z $(ss -ltnH 'sport = :443' 2>/dev/null) ]]; then ok "port 443 is free"; else warn "something listens on port 443"; fi
+  if [[ -e /etc/apache2/mods-enabled/ssl.load ]]; then ok "mod ssl enabled (HTTPS on port 443)"
+  elif [[ -z $(ss -ltnH 'sport = :443' 2>/dev/null) ]]; then ok "port 443 is free"
+  else warn "something listens on port 443"; fi
   local m
   for m in "${APACHE_MODS[@]}"; do
     [[ -e /etc/apache2/mods-enabled/$m.load ]] && ok "mod $m enabled" || { bad "mod $m not enabled (berth install)"; fails=$((fails + 1)); }
@@ -1776,9 +2154,9 @@ cmd_doctor() {
   lines=$(config_lines)
   [[ -z $lines ]] && printf '  (none)\n'
   local versions=()
-  while IFS=$'\t' read -r n p v nd c r; do
+  while IFS=$'\t' read -r n p v nd c r s; do
     [[ -z ${n:-} ]] && continue
-    c=${c:--} r=${r:-public}
+    c=${c:--} r=${r:-public} s=${s:--}
     local doc idx
     doc=$(site_docroot "$p" "$r")
     c=${c/#-/$FALLBACK_COMPOSER}
@@ -1794,8 +2172,12 @@ cmd_doctor() {
     storage_link_in_home "$doc" >/dev/null && probs+=("$r/storage points into your home; recreate it with storage:link")
     in_home "$p" && probs+=("path is inside your home; move it under $SITES_ROOT")
     vhost_enabled "$n" || probs+=("vhost not enabled")
-    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v" "$r")" ]] || probs+=("vhost out of sync with config (re-run berth site:host)")
+    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v" "$r" "$s")" ]] || probs+=("vhost out of sync with config (re-run berth site:host)")
     [[ -S $(pool_sock "$v") ]] || probs+=("$(pool_sock "$v") missing (berth php:install $v)")
+    if [[ $s == ssl ]]; then
+      site_cert_ok "$n" || probs+=("certificate missing or expiring (re-run berth site:host)")
+      [[ -e /etc/apache2/mods-enabled/ssl.load ]] || probs+=("mod ssl not enabled (re-run berth site:host)")
+    fi
     [[ $nd == - ]] || node_bin "$nd" >/dev/null 2>&1 || probs+=("Node $nd not installed (berth node:install $nd)")
     [[ -f $(composer_phar "$c") ]] || probs+=("Composer $c not installed (berth composer:install $c)")
     if (( ${#probs[@]} )); then
@@ -1806,6 +2188,11 @@ cmd_doctor() {
       ok "$n (PHP $v, Node ${nd/-/none}, Composer $c) → $doc"
     fi
   done <<<"$lines"
+
+  if ca_exists; then
+    section "HTTPS certificate authority trusted by"
+    ssl_trust_report "$(ca_fp)"
+  fi
 
   section "PHP-FPM berth pools"
   local v
@@ -1895,9 +2282,14 @@ berth
 
 Sites
   berth site:host [path] [--name n] [--root dir] [--php v] [--node v|none] [--composer v] [--ext a,b]
-                                       serve a project (or reconfigure it) at http://<name>.localhost
+                  [--ssl|--no-ssl]     serve a project (or reconfigure it) at http://<name>.localhost
   berth site:list                      list sites
   berth site:remove <name>             remove a site
+
+HTTPS
+  berth ssl:install                    create the local certificate authority and trust it here
+  berth ssl:list                       where it's trusted and each site's certificate
+  berth ssl:remove                     remove it (turn HTTPS off on every site first)
 
 PHP, Node and Composer
   berth php:install <v> [--ext a,b]    PHP <v> FPM + CLI + extensions + berth pool
@@ -1967,6 +2359,9 @@ main_dispatch() {
     php:remove) cmd_remove_php "$@" ;;
     node:remove) cmd_remove_node "$@" ;;
     composer:remove) cmd_remove_composer "$@" ;;
+    ssl:install) cmd_ssl_install "$@" ;;
+    ssl:list) cmd_ssl_list ;;
+    ssl:remove) cmd_ssl_remove "$@" ;;
     site:host) cmd_host "$@" ;;
     site:list) cmd_sites ;;
     site:remove) cmd_remove "$@" ;;
