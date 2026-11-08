@@ -15,16 +15,18 @@ berth is a single bash script. It installs what a site needs (the ondrej PHP PPA
 $ cd /srv/sites/shop && berth site:host
 
   ┏┓ ┏━╸┏━┓╺┳╸╻ ╻
-  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.3.0
+  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.4.0
   ┗━┛┗━╸╹┗╸ ╹ ╹ ╹   Apache · PHP-FPM · Node · Composer
   ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
 
   Hosting shop
-  http://shop.localhost  /srv/sites/shop
+  /srv/sites/shop
   Laravel app · serving public/
 
-  Enter keeps the suggested version; type to change it.
+  Enter keeps the suggested answer; type to change it.
 
+  Domain    the part before .localhost
+            > shop
   PHP       installed  8.2  8.3  8.5
             > 8.5
   Node      installed  18.20.8  24.15.0  26.13.0
@@ -84,14 +86,14 @@ git clone https://github.com/sajidifti/berth.git && cd berth && ./berth install
 Each step is skipped if it's already done, so running `berth install` again only repairs what's missing. To install a specific release instead of `main`, use the tag in the URL and in `BERTH_REF`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.3.0/berth | BERTH_REF=v0.3.0 bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.4.0/berth | BERTH_REF=v0.4.0 bash -s -- install
 ```
 
 ### Update
 
 ```bash
 berth update                  # latest main
-berth update --ref v0.3.0     # a specific release
+berth update --ref v0.4.0     # a specific release
 ```
 
 `berth update` downloads berth from GitHub and replaces `~/.local/bin/berth`, showing the old and new version. It changes nothing else.
@@ -122,6 +124,14 @@ cd /srv/sites/blog && berth site:host    # → http://blog.localhost
 ```
 
 Use `--root <folder>` to serve some other folder, for example `berth site:host --root dist`. The folder must be inside the project. `.htaccess` files work as usual. When the project folder itself is the web root, berth blocks web access to `.git`, `.svn`, `.hg` and `.env*`.
+
+### Custom domains
+
+`berth site:host` asks for the domain, pre-filled with the folder name. Press Enter to keep it, or edit it to serve the project somewhere else, so `/srv/sites/erp-abis` can be `http://erp.localhost`. `--name erp` does the same without the question.
+
+Run `berth site:host` again to change the domain. berth removes the old vhost and certificate, and the old address stops working. A Laravel app's `APP_URL` is yours to update, as berth never edits `.env`.
+
+The domain is always a single word under `.localhost`, because browsers resolve those names without any DNS or hosts-file setup. Every `*.<name>.localhost` subdomain already reaches the same site.
 
 ### HTTPS
 
@@ -182,7 +192,7 @@ Sites use `host`, `list` and `remove`; PHP, Node and Composer use `install`, `li
 | `--php 8.4` | PHP version (skips the question) |
 | `--node 20` / `--node none` | Node version, or no Node |
 | `--composer 2.2` | Composer version |
-| `--name shop` | Site name. Default: the folder name. The URL is `http://<name>.localhost` |
+| `--name shop` | Domain, the part before `.localhost` (skips the question). Default: the folder name, or the current name when reconfiguring |
 | `--root web` | Folder to serve, relative to the project (`.` for the project folder). Default: detected; see [Plain PHP apps](#plain-php-apps) |
 | `--ext redis,imagick` | Extra PHP extensions |
 | `--ssl` / `--no-ssl` | Turn HTTPS on or off (skips the question). See [HTTPS](#https) |

@@ -4,7 +4,7 @@
 # License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
 
-BERTH_VERSION=0.3.0
+BERTH_VERSION=0.4.0
 NVM_TAG=v0.41.0
 BERTH_REPO=sajidifti/berth
 BERTH_REF=${BERTH_REF:-main}   # branch or tag to install from when piped from curl
@@ -91,6 +91,33 @@ sanitize_name() {
   local n=${1,,}
   n=$(sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//' <<<"$n")
   printf '%s' "$n"
+}
+
+# A typed domain → the part before .localhost. Unlike a folder name, dots are kept, so that
+# site_name_problem can refuse shop.test instead of quietly serving shop-test.localhost.
+domain_label() {
+  local n=${1,,}
+  n=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/\.localhost$//; s/[^a-z0-9.-]+/-/g; s/-+/-/g; s/^-//; s/-$//' <<<"$n")
+  printf '%s' "$n"
+}
+
+# Why the project at <path> can't use this name; prints nothing when it can.
+# 54 characters, because <name>.localhost is a certificate's common name, limited to 64.
+site_name_problem() {
+  local name=$1 path=$2 clash clash_path
+  if [[ $name == *.* ]]; then
+    printf 'use a single word: it becomes <word>.localhost, and *.<word>.localhost already reaches the same site'
+  elif [[ ! $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    printf 'use letters, digits and hyphens'
+  elif (( ${#name} > 54 )); then
+    printf 'use at most 54 characters'
+  else
+    clash=$(config_get name "$name")
+    if [[ -n $clash ]]; then
+      clash_path=$(cut -f2 <<<"$clash")
+      if [[ $clash_path != "$path" ]]; then printf 'already used by %s' "$clash_path"; fi
+    fi
+  fi
 }
 
 # Map a composer ext-* name to the php<v>-<pkg> suffix. Prints nothing if built in.
@@ -839,6 +866,20 @@ ask_ssl() {
     done
   fi
   case ${a,,} in y*) printf 'ssl\n' ;; *) printf -- '-\n' ;; esac
+}
+
+# Domain question: ask_domain <default> <path> → the name. Pre-filled, like the version questions.
+ask_domain() {
+  local def=$1 path=$2 a why
+  local prompt=$'\001'"$CYN$B"$'\002'"> "$'\001'"$R"$'\002'
+  printf '  %s%-9s%s %sthe part before .localhost%s\n' "$B" "Domain" "$R" "$D" "$R" >&2
+  while :; do
+    read -e -r -i "$def" -p "            $prompt" a </dev/tty || die "aborted"
+    a=$(domain_label "${a:-$def}")
+    why=$(site_name_problem "$a" "$path")
+    [[ -z $why ]] && { printf '%s\n' "$a"; return; }
+    printf '            %s✗ "%s": %s%s\n' "$RED" "$a" "$why" "$R" >&2
+  done
 }
 
 valid_node() { [[ $1 == none || $1 =~ ^v?[0-9]+(\.[0-9]+){0,2}$ || $1 =~ ^(lts/.+|node|stable)$ ]]; }
@@ -1928,19 +1969,17 @@ cmd_host() {
   is_laravel "$path" && kind="Laravel app"
   if [[ $root == . ]]; then serving="serving the project folder"; else serving="serving $root/"; fi
 
-  # name
-  local name
-  if [[ -n $OPT_NAME ]]; then name=$(sanitize_name "$OPT_NAME")
+  # name: --name, else the site's current one, else the folder name. Without --name it's asked below.
+  local name ask_name=0
+  if [[ -n $OPT_NAME ]]; then name=$(domain_label "$OPT_NAME")
   elif [[ -n $old_name ]]; then name=$old_name
   else name=$(sanitize_name "$(basename "$path")")
   fi
-  [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "invalid site name: '$name' (use --name)"
-  local clash
-  clash=$(config_get name "$name")
-  if [[ -n $clash ]]; then
-    local clash_path
-    clash_path=$(cut -f2 <<<"$clash")
-    [[ $clash_path == "$path" ]] || die "site '$name' already points to $clash_path; pick another with --name"
+  (( ! YES )) && [[ -r /dev/tty && -z $OPT_NAME ]] && ask_name=1
+  if (( ! ask_name )); then
+    local problem
+    problem=$(site_name_problem "$name" "$path")
+    [[ -z $problem ]] || die "can't use '$name' as the domain: $problem. Pick another with --name"
   fi
 
   # composer.json hints
@@ -1957,7 +1996,7 @@ cmd_host() {
   # The PHP/Composer defaults give way only when they can't work (composer.json rules out 8.5,
   # or the PHP is too old for Composer 2.3+).
   local asking=0
-  (( ! YES )) && [[ -r /dev/tty ]] && [[ -z $OPT_PHP || -z $OPT_NODE || -z $OPT_COMPOSER || -z $OPT_SSL ]] && asking=1
+  (( ! YES )) && [[ -r /dev/tty ]] && [[ -z $OPT_NAME || -z $OPT_PHP || -z $OPT_NODE || -z $OPT_COMPOSER || -z $OPT_SSL ]] && asking=1
   if [[ -n $old_name ]]; then
     local oc=${old_composer:--}
     local old_url=http old_https=off
@@ -1968,11 +2007,13 @@ cmd_host() {
     hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$FALLBACK_COMPOSER} ${D}·${R} HTTPS $old_https"
     (( asking )) && printf '\n  %sEnter keeps the current answer; type to change it.%s\n\n' "$D" "$R"
   else
-    title "Hosting $name"
-    hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    title "Hosting ${name:-$(basename "$path")}"
+    if (( ask_name )); then hdetail "${D}$path${R}"; else hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"; fi
     hdetail "${D}$kind · $serving${R}"
     (( asking )) && printf '\n  %sEnter keeps the suggested answer; type to change it.%s\n\n' "$D" "$R"
   fi
+
+  (( ask_name )) && name=$(ask_domain "$name" "$path")
 
   local php=$OPT_PHP
   if [[ -z $php ]]; then
@@ -2081,6 +2122,7 @@ cmd_host() {
   elif [[ -n $old_name ]]; then success "$name is reconfigured and live at $url"
   else success "$name is live at $url"; fi
   detail "PHP $php · Node ${node/-/none} · Composer $composer"
+  if [[ -n $old_name && $old_name != "$name" ]]; then detail "Renamed from $old_name; $old_name.localhost no longer serves it"; fi
   ssl_hints
   if is_laravel "$path"; then
     detail "Set APP_URL=$url in .env"
