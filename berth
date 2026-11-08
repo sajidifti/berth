@@ -4,16 +4,18 @@
 # License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
 
-BERTH_VERSION=0.1.0
+BERTH_VERSION=0.2.0
 NVM_TAG=v0.41.0
 BERTH_REPO=sajidifti/berth
 BERTH_REF=${BERTH_REF:-main}   # branch or tag to install from when piped from curl
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/berth"
 CONFIG="$CONFIG_DIR/sites"
+SETTINGS="$CONFIG_DIR/config"
 NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-DEFAULT_PHP=8.5
-DEFAULT_NODE=26
-DEFAULT_COMPOSER=2
+# Used only when berth can't look up the newest versions and nothing is installed or chosen yet.
+FALLBACK_PHP=8.5
+FALLBACK_NODE=24
+FALLBACK_COMPOSER=2
 COMPOSER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/berth/composer"
 BASE_PKGS=(cli fpm common mysql mbstring xml curl zip gd intl bcmath)
 APACHE_MODS=(mpm_event proxy_fcgi setenvif rewrite)
@@ -408,7 +410,7 @@ vhost_content() { # vhost_content <name> <project> <php> [root]
   local name=$1 path=$2 php=$3 root=${4:-public} doc
   doc=$(site_docroot "$path" "$root")
   cat <<EOF
-# Managed by berth. Changes are overwritten by \`berth host\`.
+# Managed by berth. Changes are overwritten by \`berth site:host\`.
 <VirtualHost *:80>
     ServerName $name.localhost
     ServerAlias *.$name.localhost
@@ -698,8 +700,10 @@ plan_composer() {
   [[ -f $(composer_phar "$1") ]] || plan_user "download Composer $1 to $(composer_phar "$1") (sha256 verified)" do_composer_install "$1"
 }
 
+NVM_QUEUED=0
 plan_nvm() {
-  [[ -s $NVM_DIR/nvm.sh ]] && return 0
+  [[ -s $NVM_DIR/nvm.sh ]] || (( NVM_QUEUED )) && return 0
+  NVM_QUEUED=1
   plan_user "install nvm $NVM_TAG into $NVM_DIR (the installer adds a few lines to your shell rc file)" do_nvm_install
 }
 
@@ -719,7 +723,7 @@ preflight() {
 
 # ---------------------------------------------------------------- argument parsing
 
-OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER= OPT_ROOT=
+OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER= OPT_ROOT= OPT_REF=
 ARGS=()
 parse_opts() {
   while (( $# )); do
@@ -732,6 +736,8 @@ parse_opts() {
       --name=*) OPT_NAME=${1#*=} ;;
       --composer) OPT_COMPOSER=${2:?--composer needs a version}; shift ;;
       --composer=*) OPT_COMPOSER=${1#*=} ;;
+      --ref) OPT_REF=${2:?--ref needs a branch or tag}; shift ;;
+      --ref=*) OPT_REF=${1#*=} ;;
       --root) OPT_ROOT=${2:?--root needs a folder}; shift ;;
       --root=*) OPT_ROOT=${1#*=} ;;
       --ext) OPT_EXT+=",${2:?--ext needs a list}"; shift ;;
@@ -812,13 +818,8 @@ plan_self() {
 }
 
 do_self_download() {
-  local tmp url
-  url=$(berth_url)
-  tmp=$(mktemp)
-  cmdlog "curl -fsSL $url"
-  curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; die "could not download $url"; }
-  head -n1 "$tmp" | grep -q '^#!.*bash' && grep -q '^BERTH_VERSION=' "$tmp" \
-    || { rm -f "$tmp"; die "$url does not look like the berth script"; }
+  local tmp
+  tmp=$(fetch_berth)
   do_self_install "$tmp"
   rm -f "$tmp"
 }
@@ -841,11 +842,11 @@ cmd_install() {
   plan_ppa
   plan_apache
   plan_sites_root
-  plan_composer "$DEFAULT_COMPOSER"
-  plan_nvm
+  plan_install_defaults
   if run_plan; then success "berth is installed and this machine is ready"
   else success "berth is installed and this machine is already set up"; fi
-  detail "Next: put a Laravel or PHP project in $SITES_ROOT, cd into it and run berth host"
+  detail "Defaults: PHP $(default_php) · Node $(default_node) · Composer $(default_composer)  (change with berth php:default <v> …)"
+  detail "Next: put a Laravel or PHP project in $SITES_ROOT, cd into it and run berth site:host"
 }
 
 cmd_install_php() {
@@ -866,7 +867,7 @@ cmd_install_php() {
 cmd_install_composer() {
   parse_opts "$@"
   preflight
-  local v=${ARGS[0]:-${OPT_COMPOSER:-$DEFAULT_COMPOSER}}
+  local v=${ARGS[0]:-${OPT_COMPOSER:-$(default_composer)}}
   valid_composer "$v" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $v"
   title "Installing Composer $v"
   plan_composer "$v"
@@ -888,11 +889,651 @@ cmd_install_node() {
   success "$done_msg"
 }
 
+# ---------------------------------------------------------------- version lists and removal
+
+# Yes/no question on the terminal; default no. --yes answers yes, no terminal answers no.
+confirm() {
+  local a
+  (( YES )) && return 0
+  [[ -r /dev/tty ]] || return 1
+  read -r -p "  $1 [y/N] " a </dev/tty || return 1
+  [[ $a =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Names of the sites whose column $1 satisfies the test function $2 (called with the value).
+sites_where() {
+  local col=$1 fn=$2 n v
+  while IFS=$'\t' read -r n v; do
+    [[ -n $n ]] && "$fn" "$v" && printf '%s\n' "$n"
+  done < <(config_lines | awk -F'\t' -v c="$col" '{ print $1 "\t" $c }')
+  return 0
+}
+
+join_list() { local IFS=,; local s="$*"; printf '%s' "${s//,/, }"; }
+
+# Print a table: rows on stdin as "version<TAB>notes<TAB>sites"; the first argument is the title.
+version_table() {
+  local title=$1 rows
+  rows=$(cat)
+  section "$title"
+  if [[ -z $rows ]]; then printf '  %snone installed%s\n' "$D" "$R"; return 0; fi
+  { printf 'VERSION\tNOTES\tSITES\n'; printf '%s\n' "$rows"; } | column -t -s $'\t' -o '   ' | sed 's/^/  /'
+}
+
+php_release() { dpkg-query -W -f='${Version}' "php$1-cli" 2>/dev/null | sed -E 's/^[0-9]+://; s/[-+~].*//'; }
+php_cli_default() { local p; p=$(readlink -f "$(command -v php 2>/dev/null)" 2>/dev/null) || return 1; [[ $p == /usr/bin/php* ]] && printf '%s' "${p#/usr/bin/php}"; }
+
+cmd_list_php() {
+  local v notes sites cli want
+  cli=$(php_cli_default || true)
+  while IFS= read -r v; do
+    [[ -z $v ]] && continue
+    notes=$(php_release "$v")
+    [[ $v == "$cli" ]] && notes+=" · system php"
+    [[ $v == "$(default_php)" ]] && notes+=" · default"
+    [[ -f $(pool_file "$v") ]] || notes+=" · no berth pool"
+    want=$v
+    sites=$(join_list $(sites_where 3 _eq_want))
+    printf '%s\t%s\t%s\n' "$v" "$notes" "${sites:--}"
+  done < <(installed_php_versions) | version_table "PHP"
+  local avail=() missing=() a
+  mapfile -t avail < <(available_php_versions)
+  for a in "${avail[@]}"; do php_have "$a" || missing+=("$a"); done
+  (( ${#missing[@]} )) && printf '\n  %sAlso available: %s (berth php:install <v>)%s\n' "$D" "${missing[*]}" "$R"
+  return 0
+}
+_eq_want() { [[ $1 == "$want" ]]; }
+
+# The installed Node folder (vX.Y.Z) a site's spec uses, or nothing.
+node_dir_for() { local b; b=$(node_bin "$1" 2>/dev/null) && basename "$(dirname "$b")"; }
+
+cmd_list_node() {
+  local v notes sites def= n spec
+  def=$(node_dir_for "$(default_node)" || true)
+  while IFS= read -r v; do
+    [[ -z $v ]] && continue
+    notes=
+    [[ v$v == "$def" ]] && notes="default"
+    sites=()
+    while IFS=$'\t' read -r n spec; do
+      [[ -n $n && $spec != - && $(node_dir_for "$spec" || true) == "v$v" ]] && sites+=("$n")
+    done < <(config_lines | awk -F'\t' '{ print $1 "\t" $4 }')
+    sites=$(join_list "${sites[@]}")
+    printf '%s\t%s\t%s\n' "$v" "${notes:--}" "${sites:--}"
+  done < <(installed_node_versions) | version_table "Node"
+  [[ -s $NVM_DIR/nvm.sh ]] || printf '\n  %snvm is not installed (berth install)%s\n' "$D" "$R"
+  return 0
+}
+
+cmd_list_composer() {
+  local v notes sites want
+  while IFS= read -r v; do
+    [[ -z $v ]] && continue
+    notes=$(composer_show "$v")
+    [[ $v == "$(default_composer)" ]] && notes+=" · default"
+    [[ $(composer_link_state "$v") == ok ]] && notes+=" · composer command"
+    want=$v
+    sites=$(join_list $(sites_where 5 _uses_composer))
+    printf '%s\t%s\t%s\n' "$v" "$notes" "${sites:--}"
+  done < <(installed_composer_versions) | version_table "Composer"
+  local sys
+  sys=$(command -v composer 2>/dev/null || true)
+  [[ -n $sys ]] && printf '\n  %sSystem composer (not managed by berth): %s%s\n' "$D" "$sys" "$R"
+  return 0
+}
+_uses_composer() { local c=${1:--}; [[ $c == - ]] && c=$FALLBACK_COMPOSER; [[ $c == "$want" ]]; }
+
+in_use_die() { # in_use_die <what> <host flag> <sites...>
+  local what=$1 flag=$2; shift 2
+  die "$what is used by $(join_list "$@").
+       Move each to another version first (cd into it, then berth site:host $flag <version>) or remove it (berth site:remove <name>)."
+}
+
+do_php_remove() { # do_php_remove <v> <pkgs...>
+  local v=$1; shift
+  [[ -f $(pool_file "$v") ]] && sudo_run rm -f "$(pool_file "$v")"
+  sudo_run env DEBIAN_FRONTEND=noninteractive apt-get remove -y "$@"
+  APACHE_DIRTY=1
+}
+
+cmd_remove_php() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-}
+  [[ -n $v ]] || die "usage: berth php:remove <version>"
+  valid_php "$v" || die "PHP version must look like 8.3, got: $v"
+  local pkgs=() users=()
+  mapfile -t pkgs < <(dpkg-query -W -f='${Package}\t${Status}\n' "php$v" "php$v-*" 2>/dev/null | awk -F'\t' '$2 ~ /install ok installed/ { print $1 }')
+  (( ${#pkgs[@]} )) || die "PHP $v is not installed (see berth php:list)"
+  local want=$v
+  mapfile -t users < <(sites_where 3 _eq_want)
+  (( ${#users[@]} )) && in_use_die "PHP $v" --php "${users[@]}"
+  [[ $v == "$(default_php)" ]] && die "PHP $v is the default; make another version the default first (berth php:default <v>)"
+
+  title "Removing PHP $v"
+  # Let apt say what would go: packages that depend on this PHP (phpMyAdmin, php-* metapackages) go too.
+  local gone=() extra=() p
+  mapfile -t gone < <(apt-get -s remove "${pkgs[@]}" 2>/dev/null | awk '/^Remv / { print $2 }')
+  for p in "${gone[@]}"; do [[ $p == php"$v" || $p == php"$v"-* ]] || extra+=("$p"); done
+  hdetail "${D}Packages: ${gone[*]:-${pkgs[*]}}${R}"
+  [[ -f $(pool_file "$v") ]] && hdetail "${D}Pool:     $(pool_file "$v")${R}"
+  echo
+  (( ${#extra[@]} )) && warn "apt would also remove ${extra[*]}, which depend on PHP $v"
+  [[ -e /etc/apache2/conf-enabled/php$v-fpm.conf ]] && warn "Apache's php$v-fpm conf is enabled. Pages outside berth that use it (phpMyAdmin, /var/www) stop running PHP until it points at another version."
+  [[ $(php_cli_default || true) == "$v" ]] && warn "the system php command is PHP $v; Ubuntu switches it to another installed version"
+  if (( ${#extra[@]} )) && (( YES )); then
+    die "not removing other packages without asking; run without --yes to confirm"
+  fi
+  if (( ! DRYRUN && ! YES )); then
+    [[ -r /dev/tty ]] || die "no terminal to confirm on; pass --yes to remove PHP $v"
+    confirm "Remove PHP $v?" || die "nothing removed"
+  fi
+
+  local what="remove ${#gone[@]} PHP $v package(s)"
+  [[ -f $(pool_file "$v") ]] && what+=" and the berth pool"
+  plan_root "$what" do_php_remove "$v" "${pkgs[@]}"
+  queue_apache_apply
+  run_plan || true
+  success "PHP $v is removed"
+  detail "Its settings stay in /etc/php/$v; sudo apt purge 'php$v-*' deletes them"
+}
+
+cmd_remove_node() {
+  parse_opts "$@"
+  preflight
+  local spec=${ARGS[0]:-}
+  [[ -n $spec ]] || die "usage: berth node:remove <version>"
+  local dir
+  dir=$(node_dir_for "$spec") || die "Node $spec is not installed (see berth node:list)"
+  # A site loses nothing if its spec still resolves to another installed version afterwards.
+  local users=() n s
+  while IFS=$'\t' read -r n s; do
+    [[ -n $n && $s != - ]] && node_spec_needs "$s" "$dir" && users+=("$n")
+  done < <(config_lines | awk -F'\t' '{ print $1 "\t" $4 }')
+  (( ${#users[@]} )) && in_use_die "Node $dir" --node "${users[@]}"
+  node_spec_needs "$(default_node)" "$dir" \
+    && die "Node $dir is the default (Node $(default_node)); make another version the default first (berth node:default <v>)"
+
+  title "Removing Node $dir"
+  plan_user "nvm uninstall $dir" do_node_remove "$dir"
+  run_plan || true
+  success "Node $dir is removed"
+}
+
+# Does Node spec $1 (a site's or the default) need the installed folder $2, with nothing else matching?
+node_spec_needs() {
+  local s=$1 dir=$2 v
+  [[ $(node_dir_for "$s" || true) == "$dir" ]] || return 1
+  if [[ $s =~ ^v?[0-9]+(\.[0-9]+){0,2}$ ]]; then
+    for v in $(installed_node_versions); do
+      [[ v$v != "$dir" && ( $v == "${s#v}" || $v == "${s#v}".* ) ]] && return 1
+    done
+  fi
+  return 0
+}
+
+do_node_remove() {
+  cmdlog "nvm uninstall $1"
+  nvm_run nvm uninstall "$1" >/dev/null || die "nvm uninstall $1 failed"
+}
+
+cmd_remove_composer() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-}
+  [[ -n $v ]] || die "usage: berth composer:remove <version>"
+  valid_composer "$v" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $v"
+  composer_have "$v" || die "Composer $v is not installed (see berth composer:list)"
+  local want=$v users=()
+  mapfile -t users < <(sites_where 5 _uses_composer)
+  (( ${#users[@]} )) && in_use_die "Composer $v" --composer "${users[@]}"
+  [[ $v == "$(default_composer)" ]] && die "Composer $v is the default; make another version the default first (berth composer:default <v>)"
+  local rel
+  rel=$(composer_show "$v")
+  title "Removing Composer $v ($rel)"
+  plan_user "delete $(composer_phar "$v")" do_composer_remove "$v"
+  run_plan || true
+  success "Composer $v is removed"
+}
+
+do_composer_remove() { cmdlog "rm $(composer_phar "$1")"; rm -f "$(composer_phar "$1")"; }
+
+# ---------------------------------------------------------------- defaults
+
+# ~/.config/berth/config holds key=value lines: php=8.5, node=24, composer=2.
+settings_get() { [[ -f $SETTINGS ]] && sed -n "s/^$1=//p" "$SETTINGS" | tail -n1; return 0; }
+settings_set() {
+  local tmp
+  mkdir -p "$CONFIG_DIR"
+  tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+  { [[ -f $SETTINGS ]] && grep -v "^$1=" "$SETTINGS"; printf '%s=%s\n' "$1" "$2"; } >"$tmp" || true
+  mv "$tmp" "$SETTINGS"
+  cmdlog "set $1=$2 in $SETTINGS"
+}
+do_settings_set() { settings_set "$@"; }
+
+# berth's defaults: the recorded choice, else what the machine already uses, else the fallback.
+default_php() {
+  local v
+  v=$(settings_get php); [[ -n $v ]] && { echo "$v"; return; }
+  v=$(php_cli_default || true); [[ -n $v ]] && php_have "$v" && { echo "$v"; return; }
+  v=$(installed_php_versions | tail -n1); [[ -n $v ]] && { echo "$v"; return; }
+  echo "$FALLBACK_PHP"
+}
+default_node() {
+  local v
+  v=$(settings_get node); [[ -n $v ]] && { echo "$v"; return; }
+  [[ -s $NVM_DIR/alias/default ]] && v=$(<"$NVM_DIR/alias/default") && valid_node "$v" && [[ $v != none ]] && { echo "${v#v}"; return; }
+  echo "$FALLBACK_NODE"
+}
+default_composer() {
+  local v
+  v=$(settings_get composer); [[ -n $v ]] && { echo "$v"; return; }
+  echo "$FALLBACK_COMPOSER"
+}
+
+# Newest stable PHP (x.y) according to php.net; the PPA can list pre-releases.
+latest_php() {
+  local v
+  v=$(curl -fsSL --max-time 20 'https://www.php.net/releases/?json&version=8' 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null) || v=
+  [[ $v =~ ^([0-9]+\.[0-9]+)\. ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
+  warn "could not look up the newest PHP on php.net; using $FALLBACK_PHP"
+  echo "$FALLBACK_PHP"
+}
+
+# Major version of the newest Node LTS according to nodejs.org.
+latest_node_lts() {
+  local v
+  v=$(curl -fsSL --max-time 20 https://nodejs.org/dist/index.json 2>/dev/null \
+      | python3 -c 'import json,sys; print(next(x["version"] for x in json.load(sys.stdin) if x["lts"]))' 2>/dev/null) || v=
+  [[ $v =~ ^v([0-9]+)\. ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
+  warn "could not look up the newest Node LTS on nodejs.org; using $FALLBACK_NODE"
+  echo "$FALLBACK_NODE"
+}
+
+# PHP's commands managed by update-alternatives; each is switched if that version provides it.
+PHP_ALTS=(php phar phar.phar php-config phpize)
+
+php_alts_ok() { # every PHP command that version $1 provides points to it
+  local n
+  for n in "${PHP_ALTS[@]}"; do
+    [[ -e /usr/bin/$n$1 ]] || continue
+    [[ $(readlink -f "/etc/alternatives/$n" 2>/dev/null) == "$(readlink -f "/usr/bin/$n$1")" ]] || return 1
+  done
+  [[ -e /usr/bin/php$1 ]]
+}
+
+do_php_alternatives() {
+  local n
+  for n in "${PHP_ALTS[@]}"; do
+    [[ -e /usr/bin/$n$1 ]] && update-alternatives --list "$n" 2>/dev/null | grep -qx "/usr/bin/$n$1" \
+      && sudo_run update-alternatives --set "$n" "/usr/bin/$n$1"
+  done
+  return 0
+}
+
+nvm_alias_default() { [[ -s $NVM_DIR/alias/default ]] && cat "$NVM_DIR/alias/default"; }
+do_node_alias() { cmdlog "nvm alias default $1"; nvm_run nvm alias default "$1" >/dev/null || die "nvm alias default $1 failed"; }
+
+COMPOSER_LINK="$HOME/.local/bin/composer"
+
+# State of ~/.local/bin/composer for Composer $1: ok | free | berth (another berth phar) | foreign
+composer_link_state() {
+  local t
+  if [[ -L $COMPOSER_LINK ]]; then
+    t=$(readlink "$COMPOSER_LINK")
+    [[ $t == "$(composer_phar "$1")" ]] && { echo ok; return; }
+    [[ $t == "$COMPOSER_DIR"/* ]] && { echo berth; return; }
+    echo foreign
+  elif [[ -e $COMPOSER_LINK ]]; then echo foreign
+  else echo free
+  fi
+}
+
+do_composer_link() {
+  cmdlog "ln -sfn $(composer_phar "$1") $COMPOSER_LINK"
+  mkdir -p "$(dirname "$COMPOSER_LINK")"
+  ln -sfn "$(composer_phar "$1")" "$COMPOSER_LINK"
+}
+
+# Queue making $1 the default PHP: installed with a berth pool, the system php, recorded.
+plan_default_php() {
+  local v=$1
+  plan_php "$v"
+  # Before the install, the alternatives can't be checked yet; do_php_alternatives is a no-op when right.
+  if ! php_have "$v" || ! php_alts_ok "$v"; then
+    plan_root "make PHP $v the system php (update-alternatives)" do_php_alternatives "$v"
+  fi
+  [[ $(settings_get php) == "$v" ]] || plan_user "record PHP $v as berth's default" do_settings_set php "$v"
+}
+
+plan_default_node() {
+  local v=$1
+  plan_node "$v"
+  [[ $(nvm_alias_default) == "$v" ]] || plan_user "make Node $v nvm's default (nvm alias default $v)" do_node_alias "$v"
+  [[ $(settings_get node) == "$v" ]] || plan_user "record Node $v as berth's default" do_settings_set node "$v"
+}
+
+# plan_default_composer <v> → also points ~/.local/bin/composer at it, unless something else is there.
+plan_default_composer() {
+  local v=$1
+  plan_composer "$v"
+  case $(composer_link_state "$v") in
+    ok) ;;
+    free|berth) plan_user "point $COMPOSER_LINK at Composer $v" do_composer_link "$v" ;;
+    foreign) warn "$COMPOSER_LINK exists and isn't berth's, so it stays; plain composer won't switch to Composer $v" ;;
+  esac
+  [[ $(settings_get composer) == "$v" ]] || plan_user "record Composer $v as berth's default" do_settings_set composer "$v"
+}
+
+# berth install: a missing tool is installed at its newest version and made the default;
+# a tool that's already there is adopted as it is, and nothing on the system is switched.
+plan_install_defaults() {
+  local v
+  # PHP
+  v=$(settings_get php)
+  if [[ -n $v ]]; then
+    plan_php "$v"
+  elif v=$(php_cli_default) && [[ -n $v ]] && php_have "$v"; then
+    plan_php "$v"
+    plan_user "record PHP $v (your system php) as berth's default" do_settings_set php "$v"
+  elif v=$(installed_php_versions | tail -n1) && [[ -n $v ]]; then
+    plan_php "$v"
+    plan_user "record PHP $v as berth's default" do_settings_set php "$v"
+  else
+    plan_default_php "$(latest_php)"
+  fi
+  # Node
+  plan_nvm
+  v=$(settings_get node)
+  if [[ -n $v ]]; then
+    plan_node "$v"
+  elif [[ -n $(installed_node_versions) ]]; then
+    v=$(nvm_alias_default || true)
+    if [[ -z $v ]] || ! node_bin "$v" >/dev/null 2>&1; then v=$(installed_node_versions | tail -n1 | cut -d. -f1); fi
+    plan_user "record Node ${v#v} (nvm's default) as berth's default" do_settings_set node "${v#v}"
+  else
+    plan_default_node "$(latest_node_lts)"
+  fi
+  # Composer
+  v=$(settings_get composer)
+  if [[ -n $v ]]; then
+    plan_composer "$v"
+  elif [[ -n $(installed_composer_versions) ]]; then
+    v=$FALLBACK_COMPOSER
+    composer_have "$v" || v=$(installed_composer_versions | tail -n1)
+    plan_user "record Composer $v as berth's default" do_settings_set composer "$v"
+  elif command -v composer >/dev/null 2>&1; then
+    # A composer of your own stays the composer command; berth keeps its copy for sites.
+    plan_composer "$FALLBACK_COMPOSER"
+    plan_user "record Composer $FALLBACK_COMPOSER as berth's default" do_settings_set composer "$FALLBACK_COMPOSER"
+  else
+    plan_default_composer "$FALLBACK_COMPOSER"
+  fi
+}
+
+cmd_default_php() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-}
+  if [[ -z $v ]]; then
+    info "PHP $(default_php)  (system php: $(php_cli_default || echo none))"
+    return 0
+  fi
+  valid_php "$v" || die "PHP version must look like 8.3, got: $v"
+  title "Making PHP $v the default"
+  plan_base_tools
+  plan_default_php "$v"
+  if run_plan; then success "PHP $v is the default"; else success "PHP $v is already the default"; fi
+  detail "php → $(readlink -f "$(command -v php)" 2>/dev/null || echo '?') · new sites suggest PHP $v"
+}
+
+cmd_default_node() {
+  parse_opts "$@"
+  preflight
+  local v=${ARGS[0]:-}
+  if [[ -z $v ]]; then
+    info "Node $(default_node)  (nvm default: $(nvm_alias_default || echo none))"
+    return 0
+  fi
+  v=${v#v}
+  valid_node "$v" && [[ $v != none ]] || die "not a Node version: $v"
+  title "Making Node $v the default"
+  plan_default_node "$v"
+  if run_plan; then success "Node $v is the default"; else success "Node $v is already the default"; fi
+  detail "New shells use it (nvm default) · new sites suggest Node $v"
+}
+
+cmd_default_composer() {
+  parse_opts "$@"
+  local v=${ARGS[0]:-}
+  if [[ -z $v ]]; then
+    info "Composer $(default_composer)  (composer command: $(command -v composer || echo none))"
+    return 0
+  fi
+  valid_composer "$v" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $v"
+  title "Making Composer $v the default"
+  plan_default_composer "$v"
+  if run_plan; then success "Composer $v is the default"; else success "Composer $v is already the default"; fi
+  local c
+  c=$(command -v composer 2>/dev/null || true)
+  if [[ $(composer_link_state "$v") == ok ]]; then
+    if [[ $c == "$COMPOSER_LINK" ]]; then detail "composer → Composer $v ($(composer_show "$v")) · new sites suggest Composer $v"
+    else warn "$c comes before $COMPOSER_LINK on your PATH, so plain composer still runs it"; fi
+  fi
+}
+
+# ---------------------------------------------------------------- updates
+
+# Download berth ($BERTH_REF) to a temp file and check it is the berth script → prints the path.
+fetch_berth() {
+  local tmp url
+  url=$(berth_url)
+  tmp=$(mktemp)
+  cmdlog "curl -fsSL $url" >&2
+  curl -fsL "$url" -o "$tmp" || { rm -f "$tmp"; die "could not download $url (is $BERTH_REF a branch or tag of $BERTH_REPO?)"; }
+  head -n1 "$tmp" | grep -q '^#!.*bash' && grep -q '^BERTH_VERSION=' "$tmp" \
+    || { rm -f "$tmp"; die "$url does not look like the berth script"; }
+  printf '%s\n' "$tmp"
+}
+
+script_version() { sed -n 's/^BERTH_VERSION=//p' "$1" | head -n1; }
+
+cmd_update() {
+  parse_opts "$@"
+  preflight
+  [[ -n $OPT_REF ]] && BERTH_REF=$OPT_REF
+  local cur=$BERTH_VERSION tmp new
+  [[ -f $SELF_DEST ]] && cur=$(script_version "$SELF_DEST")
+  title "Updating berth"
+  hdetail "${D}from github.com/$BERTH_REPO ($BERTH_REF)${R}"
+  echo
+  tmp=$(fetch_berth)
+  new=$(script_version "$tmp")
+  if [[ -f $SELF_DEST ]] && cmp -s "$tmp" "$SELF_DEST"; then
+    rm -f "$tmp"
+    success "berth is up to date ($cur)"
+    return 0
+  fi
+  # Never go back a version by accident; an explicit --ref is a deliberate choice.
+  if [[ -z $OPT_REF && -n $cur && $cur != "$new" ]] && ver_ge "$cur" "$new"; then
+    rm -f "$tmp"
+    die "$BERTH_REF has berth $new, older than your $cur; to switch anyway: berth update --ref $BERTH_REF"
+  fi
+  if (( DRYRUN )); then
+    rm -f "$tmp"
+    local change="${cur:-none} → $new"
+    [[ $cur == "$new" ]] && change="a newer build of $new"
+    printf '\n  %sDry run. Would replace %s with %s.%s\n' "$D" "$SELF_DEST" "$change" "$R"
+    exit 0
+  fi
+  do_self_install "$tmp"
+  rm -f "$tmp"
+  if [[ $cur == "$new" ]]; then success "berth $new is updated to the latest $BERTH_REF"
+  else success "berth is updated: $cur → $new"; fi
+  detail "If the release notes mention new setup, run berth install"
+}
+
+# Installed and candidate versions of packages: lines "pkg<TAB>installed<TAB>candidate".
+apt_versions() {
+  apt-cache policy "$@" 2>/dev/null | awk '
+    /^[^ ].*:$/ { p = substr($0, 1, length($0) - 1) }
+    /^  Installed:/ { i = $2 }
+    /^  Candidate:/ { print p "\t" i "\t" $2 }'
+}
+
+php_pkgs_installed() { dpkg-query -W -f='${Package}\t${Status}\n' "php$1" "php$1-*" 2>/dev/null | awk -F'\t' '$2 ~ /install ok installed/ { print $1 }'; }
+deb_release() { sed -E 's/^[0-9]+://; s/[-+~].*//' <<<"$1"; }
+
+do_apt_refresh() { sudo_run apt-get update -q; APT_UPDATED=1; }
+
+do_php_upgrade() { # do_php_upgrade <v> <pkgs...>
+  local v=$1; shift
+  sudo_run env DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "$@"
+  sudo_run systemctl restart "php$v-fpm"
+}
+
+cmd_update_php() {
+  parse_opts "$@"
+  preflight
+  local vs=()
+  if (( ${#ARGS[@]} )); then
+    vs=("${ARGS[@]}")
+    local v
+    for v in "${vs[@]}"; do
+      valid_php "$v" || die "PHP version must look like 8.3, got: $v"
+      php_have "$v" || die "PHP $v is not installed (see berth php:list)"
+    done
+  else
+    mapfile -t vs < <(installed_php_versions)
+    (( ${#vs[@]} )) || die "no PHP versions are installed (berth php:install <v>)"
+  fi
+  title "Updating PHP ${vs[*]}"
+  # Fresh package lists first, so apt knows the newest releases (a dry run uses the lists it has).
+  if (( DRYRUN )); then
+    printf '  %sUsing the package lists from the last apt update.%s\n' "$D" "$R"
+  else
+    echo
+    sudo_begin
+    do_apt_refresh
+  fi
+  local v pkgs up name inst cand latest=() current=()
+  for v in "${vs[@]}"; do
+    mapfile -t pkgs < <(php_pkgs_installed "$v")
+    up=()
+    while IFS=$'\t' read -r name inst cand; do
+      [[ -n $cand && $cand != "(none)" && $inst != "(none)" ]] || continue
+      dpkg --compare-versions "$cand" gt "$inst" && up+=("$name")
+    done < <(apt_versions "${pkgs[@]}")
+    local from to
+    from=$(php_release "$v")
+    if (( ${#up[@]} )); then
+      to=$(deb_release "$(apt_versions "php$v-cli" | cut -f3)")
+      plan_root "upgrade PHP $v ($from → $to, ${#up[@]} package(s)) and restart php$v-fpm" do_php_upgrade "$v" "${up[@]}"
+    else
+      current+=("$v ($from)")
+    fi
+  done
+  if run_plan; then
+    for v in "${vs[@]}"; do latest+=("$v ($(php_release "$v"))"); done
+    success "PHP is updated: $(join_list "${latest[@]}")"
+  else
+    success "PHP is up to date: $(join_list "${current[@]}")"
+  fi
+}
+
+# "24", "lts/*", "node" … are lines that move; an exact x.y.z is pinned.
+node_pinned() { [[ ${1#v} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+do_node_update() { # do_node_update <new vX.Y.Z> <old vX.Y.Z>
+  cmdlog "nvm install $1 --reinstall-packages-from=$2"
+  nvm_run nvm install "$1" --reinstall-packages-from="$2" || die "nvm install $1 failed"
+}
+
+cmd_update_node() {
+  parse_opts "$@"
+  preflight
+  [[ -s $NVM_DIR/nvm.sh ]] || die "nvm is not installed (berth install)"
+  local specs=() s
+  if (( ${#ARGS[@]} )); then
+    specs=("${ARGS[@]}")
+  else
+    mapfile -t specs < <(installed_node_versions | cut -d. -f1 | sort -un)
+    (( ${#specs[@]} )) || die "no Node versions are installed (berth node:install <v>)"
+  fi
+  for s in "${specs[@]}"; do
+    node_pinned "$s" && die "Node $s is an exact version, so it has nothing to update to; update its line instead (e.g. berth node:update ${s%%.*})"
+  done
+  title "Updating Node ${specs[*]}"
+  local old new current=() done_=() olds=()
+  for s in "${specs[@]}"; do
+    old=$(node_dir_for "$s") || die "Node $s is not installed (berth node:install $s)"
+    new=$(nvm_run nvm version-remote "$s" 2>/dev/null) || new=
+    [[ $new == v* ]] || die "could not look up the newest Node $s (offline?)"
+    if [[ $new == "$old" ]]; then
+      current+=("$s (${old#v})")
+    else
+      plan_user "nvm install $new (Node $s: ${old#v} → ${new#v}, global npm packages carried over)" do_node_update "$new" "$old"
+      done_+=("$s (${new#v})")
+      olds+=("${old#v}")
+    fi
+  done
+  if run_plan; then
+    success "Node is updated: $(join_list "${done_[@]}")"
+    detail "Sites using these lines now run the new release."
+    detail "The old releases stay installed; remove them with berth node:remove <version> ($(join_list "${olds[@]}"))"
+  else
+    success "Node is up to date: $(join_list "${current[@]}")"
+  fi
+}
+
+# Newest Composer on a line (1, 2, 2.2) according to getcomposer.org.
+composer_latest() {
+  curl -fsSL --max-time 20 https://getcomposer.org/versions 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d[sys.argv[1]][0]["version"])' "$1" 2>/dev/null
+}
+
+cmd_update_composer() {
+  parse_opts "$@"
+  local vs=() v
+  if (( ${#ARGS[@]} )); then
+    vs=("${ARGS[@]}")
+    for v in "${vs[@]}"; do
+      valid_composer "$v" || die "Composer version must be 2, 2.2, 1 or an exact version like 2.7.9, got: $v"
+      composer_have "$v" || die "Composer $v is not installed (see berth composer:list)"
+      [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && die "Composer $v is an exact version, so it has nothing to update to"
+    done
+  else
+    for v in $(installed_composer_versions); do [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || vs+=("$v"); done
+    (( ${#vs[@]} )) || die "no Composer lines are installed (berth composer:install 2)"
+  fi
+  title "Updating Composer ${vs[*]}"
+  local cur new current=() done_=()
+  for v in "${vs[@]}"; do
+    cur=$(composer_show "$v")
+    new=$(composer_latest "$v") || new=
+    [[ -n $new ]] || die "could not look up the newest Composer $v (offline?)"
+    if [[ $new == "$cur" ]]; then
+      current+=("$v ($cur)")
+    else
+      plan_user "download Composer $v ($cur → $new, sha256 verified)" do_composer_install "$v"
+      done_+=("$v ($new)")
+    fi
+  done
+  if run_plan; then success "Composer is updated: $(join_list "${done_[@]}")"
+  else success "Composer is up to date: $(join_list "${current[@]}")"; fi
+}
+
 suggest_php() { # suggest_php <project> <constraint>
   local cons=$2 installed=() avail=() m
   # The default wins whenever composer.json allows it.
-  if [[ -z $cons || -n $(php_matching "$cons" "$DEFAULT_PHP") ]]; then
-    printf '%s\n' "$DEFAULT_PHP"
+  local def
+  def=$(default_php)
+  if [[ -z $cons || -n $(php_matching "$cons" "$def") ]]; then
+    printf '%s\n' "$def"
     return
   fi
   mapfile -t installed < <(installed_php_versions)
@@ -905,12 +1546,12 @@ suggest_php() { # suggest_php <project> <constraint>
     m=$(php_matching "$cons" "${avail[@]}" | head -n1)
     [[ -n $m ]] && { printf '%s\n' "$m"; return; }
   fi
-  printf '%s\n' "$DEFAULT_PHP"
+  printf '%s\n' "$def"
 }
 
 # Composer 2.3+ needs PHP 7.2.5; older PHP gets the 2.2 LTS line.
 suggest_composer() {
-  if ver_ge "$1" 7.3; then printf '%s\n' "$DEFAULT_COMPOSER"; else printf '2.2\n'; fi
+  if ver_ge "$1" 7.3; then default_composer; else printf '2.2\n'; fi
 }
 
 cmd_host() {
@@ -922,7 +1563,7 @@ cmd_host() {
   if in_home "$path"; then
     die "$path is inside your home folder, which Apache can't enter.
        Move the project under $SITES_ROOT, e.g.:
-         mv $path $SITES_ROOT/ && cd $SITES_ROOT/$(basename "$path") && berth host
+         mv $path $SITES_ROOT/ && cd $SITES_ROOT/$(basename "$path") && berth site:host
        (berth install creates $SITES_ROOT.)"
   fi
 
@@ -938,7 +1579,7 @@ cmd_host() {
   elif [[ -n $old_root ]]; then root=$old_root
   elif ! root=$(detect_root "$path"); then
     die "no index.php or index.html in $path or in its public/, web/, public_html/, htdocs/, www/ or html/.
-       Point berth at the folder to serve: berth host --root <folder>"
+       Point berth at the folder to serve: berth site:host --root <folder>"
   fi
   doc=$(site_docroot "$path" "$root")
   [[ -d $doc ]] || die "web root $doc does not exist"
@@ -982,7 +1623,7 @@ cmd_host() {
     title "Reconfiguring $name"
     hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
     hdetail "${D}$kind · $serving${R}"
-    hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$DEFAULT_COMPOSER}"
+    hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$FALLBACK_COMPOSER}"
     (( asking )) && printf '\n  %sEnter keeps the current version; type to change it.%s\n\n' "$D" "$R"
   else
     title "Hosting $name"
@@ -1003,7 +1644,7 @@ cmd_host() {
 
   local node=$OPT_NODE
   if [[ -z $node ]]; then
-    local ndef=${old_node:-$DEFAULT_NODE}
+    local ndef=${old_node:-$(default_node)}
     [[ $ndef == - ]] && ndef=none
     node=$(ask Node "$ndef" valid_node installed_node_versions node_have)
   fi
@@ -1075,14 +1716,14 @@ cmd_host() {
   fi
 }
 
-cmd_rm() {
+cmd_remove() {
   parse_opts "$@"
   preflight
   local name=${ARGS[0]:-}
-  [[ -n $name ]] || die "usage: berth rm <name>"
+  [[ -n $name ]] || die "usage: berth site:remove <name>"
   local line
   line=$(config_get name "$name")
-  [[ -n $line || -f $(vhost_file "$name") ]] || die "no site named $name (see berth sites)"
+  [[ -n $line || -f $(vhost_file "$name") ]] || die "no site named $name (see berth site:list)"
   title "Removing $name"
   if [[ -f $(vhost_file "$name") ]] || vhost_enabled "$name"; then
     plan_root "disable and delete vhost berth-$name" do_vhost_remove "$name"
@@ -1097,7 +1738,7 @@ cmd_sites() {
   local lines
   lines=$(config_lines)
   if [[ -z $lines ]]; then
-    info "No sites yet. Put a project in $SITES_ROOT, cd into it and run berth host."
+    info "No sites yet. Put a project in $SITES_ROOT, cd into it and run berth site:host."
     return 0
   fi
   {
@@ -1107,7 +1748,7 @@ cmd_sites() {
       [[ -d $p ]] || mark=' (missing)'
       c=${c:--} r=${r:-public}
       [[ $r == . ]] && r=./ || r=$r/
-      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\t%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$DEFAULT_COMPOSER}" "$p" "$mark" "$r"
+      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\t%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$FALLBACK_COMPOSER}" "$p" "$mark" "$r"
     done <<<"$lines"
   } | column -t -s $'\t'
 }
@@ -1140,20 +1781,20 @@ cmd_doctor() {
     c=${c:--} r=${r:-public}
     local doc idx
     doc=$(site_docroot "$p" "$r")
-    c=${c/#-/$DEFAULT_COMPOSER}
+    c=${c/#-/$FALLBACK_COMPOSER}
     versions+=("$v")
     local probs=()
     if ! idx=$(docroot_index "$doc"); then
       probs+=("no index.php or index.html in $doc")
     elif sudo -n true 2>/dev/null; then
-      sudo -u www-data test -r "$idx" || probs+=("www-data cannot read $idx (re-run berth host)")
+      sudo -u www-data test -r "$idx" || probs+=("www-data cannot read $idx (re-run berth site:host)")
     else
-      acl_ok "$doc" || probs+=("www-data cannot read $doc (re-run berth host)")
+      acl_ok "$doc" || probs+=("www-data cannot read $doc (re-run berth site:host)")
     fi
     storage_link_in_home "$doc" >/dev/null && probs+=("$r/storage points into your home; recreate it with storage:link")
     in_home "$p" && probs+=("path is inside your home; move it under $SITES_ROOT")
     vhost_enabled "$n" || probs+=("vhost not enabled")
-    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v" "$r")" ]] || probs+=("vhost out of sync with config (re-run berth host)")
+    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v" "$r")" ]] || probs+=("vhost out of sync with config (re-run berth site:host)")
     [[ -S $(pool_sock "$v") ]] || probs+=("$(pool_sock "$v") missing (berth php:install $v)")
     [[ $nd == - ]] || node_bin "$nd" >/dev/null 2>&1 || probs+=("Node $nd not installed (berth node:install $nd)")
     [[ -f $(composer_phar "$c") ]] || probs+=("Composer $c not installed (berth composer:install $c)")
@@ -1213,10 +1854,10 @@ cmd_composer() {
     php="php$v"
     c=$(project_composer) || c=
   fi
-  [[ -z $c || $c == - ]] && c=$DEFAULT_COMPOSER
+  [[ -z $c || $c == - ]] && c=$(default_composer)
   phar=$(composer_phar "$c")
   if [[ ! -f $phar ]]; then
-    [[ $c == "$DEFAULT_COMPOSER" ]] && command -v composer >/dev/null \
+    [[ $c == "$(default_composer)" ]] && command -v composer >/dev/null \
       && exec "$php" "$(command -v composer)" "$@"
     die "Composer $c is not installed (berth composer:install $c)"
   fi
@@ -1246,23 +1887,43 @@ banner() {
 usage() {
   banner
   cat <<EOF
-Setup
-  berth install                       install berth to ~/.local/bin + PPA, Apache modules, nvm
-  berth php:install <v> [--ext a,b]   PHP <v> FPM + CLI + extensions + berth pool
-  berth node:install <v>              nvm install <v>
-  berth composer:install [v]          download Composer v (2, 2.2, 1 or x.y.z; default 2)
+berth
+  berth install                        install berth, Apache, and PHP/Node/Composer if missing
+  berth update [--ref tag]             update berth itself from GitHub
+  berth doctor                         health checks
+  berth help | version
 
 Sites
-  berth host [path] [--name n] [--root dir] [--php v] [--node v|none] [--composer v] [--ext a,b]
-                                      serve a project (or reconfigure it) at http://<name>.localhost
-  berth sites                         list sites
-  berth rm <name>                     remove a site
-  berth doctor                        health checks
+  berth site:host [path] [--name n] [--root dir] [--php v] [--node v|none] [--composer v] [--ext a,b]
+                                       serve a project (or reconfigure it) at http://<name>.localhost
+  berth site:list                      list sites
+  berth site:remove <name>             remove a site
+
+PHP, Node and Composer
+  berth php:install <v> [--ext a,b]    PHP <v> FPM + CLI + extensions + berth pool
+  berth php:list                       installed PHP versions and the sites using them
+  berth php:update [v]                 newest patch release of PHP v (all versions if omitted)
+  berth php:default [v]                make PHP <v> the default and the system php (shows it without v)
+  berth php:remove <v>                 apt remove PHP <v> and its berth pool (asks first)
+  berth node:install <v>               nvm install <v>
+  berth node:list                      installed Node versions and the sites using them
+  berth node:update [v]                newest release of Node line v, e.g. 24 (all if omitted)
+  berth node:default [v]               make Node <v> the default and nvm's default
+  berth node:remove <v>                nvm uninstall <v>
+  berth composer:install [v]           download Composer v (2, 2.2, 1 or x.y.z; default 2)
+  berth composer:list                  installed Composer versions and the sites using them
+  berth composer:update [v]            newest release of Composer line v (all if omitted)
+  berth composer:default [v]           make Composer <v> the default and the composer command
+  berth composer:remove <v>            delete Composer <v>
+  (a version that a site or the default uses is never removed)
 
 Run with the project's versions (system defaults outside a hosted project)
   berth php … | composer … | node … | npm … | npx …
 
-Options for setup/host/rm: --yes (take the suggested versions without asking), --dry-run (list what would be done)
+Options for install, update, host and remove commands:
+  --yes       take the suggested answers without asking
+  --dry-run   list what would be done and change nothing
+
 Config: $CONFIG
 EOF
 }
@@ -1272,23 +1933,43 @@ main() {
   (( $# )) && shift
   # Setup and configuration commands open with the banner; pass-throughs and listings stay plain.
   case $cmd in
-    install|php:install|node:install|composer:install|host|rm|remove)
+    install|update|*:install|*:update|*:remove|site:host|*:default)
+      [[ $cmd == *:default && $# -eq 0 ]] && { main_dispatch "$cmd" "$@"; return; }
       banner
       # When the script itself arrives on stdin (curl | bash), keep apt, nvm & co from reading it.
       [[ -z ${BASH_SOURCE[0]:-} || ! -f ${BASH_SOURCE[0]:-} ]] && exec </dev/null
       ;;
   esac
+  main_dispatch "$cmd" "$@"
+}
+
+main_dispatch() {
+  local cmd=$1
+  shift
   case $cmd in
     php) cmd_php "$@" ;;
     composer) cmd_composer "$@" ;;
     node|npm|npx) cmd_node_tool "$cmd" "$@" ;;
     install) cmd_install "$@" ;;
+    update) cmd_update "$@" ;;
+    php:update) cmd_update_php "$@" ;;
+    php:default) cmd_default_php "$@" ;;
+    node:default) cmd_default_node "$@" ;;
+    composer:default) cmd_default_composer "$@" ;;
+    node:update) cmd_update_node "$@" ;;
+    composer:update) cmd_update_composer "$@" ;;
     php:install) cmd_install_php "$@" ;;
     node:install) cmd_install_node "$@" ;;
     composer:install) cmd_install_composer "$@" ;;
-    host) cmd_host "$@" ;;
-    sites|list|ls) cmd_sites ;;
-    rm|remove) cmd_rm "$@" ;;
+    php:list) cmd_list_php ;;
+    node:list) cmd_list_node ;;
+    composer:list) cmd_list_composer ;;
+    php:remove) cmd_remove_php "$@" ;;
+    node:remove) cmd_remove_node "$@" ;;
+    composer:remove) cmd_remove_composer "$@" ;;
+    site:host) cmd_host "$@" ;;
+    site:list) cmd_sites ;;
+    site:remove) cmd_remove "$@" ;;
     doctor) cmd_doctor ;;
     version|--version|-v) echo "berth $BERTH_VERSION" ;;
     help|-h|--help) usage ;;
