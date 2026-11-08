@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# berth — serve local Laravel projects as http://<name>.localhost with Apache + per-site PHP-FPM.
+# berth — serve local Laravel and PHP projects as http://<name>.localhost with Apache + per-site PHP-FPM.
 # See README.md. Runs as the user; sudo wraps only the system steps.
 # License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
@@ -225,7 +225,8 @@ installed_composer_versions() {
 
 config_lines() { [[ -f $CONFIG ]] && grep -v '^\s*\(#\|$\)' "$CONFIG" || true; }
 
-# config_get <field:name|path> <value> → "name<TAB>path<TAB>php<TAB>node"
+# config_get <field:name|path> <value> → "name<TAB>path<TAB>php<TAB>node<TAB>composer<TAB>root"
+# (lines written before web roots existed have no root column and mean "public")
 config_get() {
   local col=1
   [[ $1 == path ]] && col=2
@@ -233,11 +234,11 @@ config_get() {
 }
 
 config_set() {
-  local name=$1 path=$2 php=$3 node=$4 composer=${5:--} tmp
+  local name=$1 path=$2 php=$3 node=$4 composer=${5:--} root=${6:-public} tmp
   mkdir -p "$CONFIG_DIR"
   tmp=$(mktemp "$CONFIG_DIR/.sites.XXXXXX")
   config_lines | awk -F'\t' -v n="$name" -v p="$path" '$1 != n && $2 != p' >"$tmp"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$node" "$composer" >>"$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$node" "$composer" "$root" >>"$tmp"
   sort -o "$tmp" "$tmp"
   mv "$tmp" "$CONFIG"
   cmdlog "updated $CONFIG ($name)"
@@ -292,11 +293,47 @@ in_home() {
   [[ $1 == "$h" || $1 == "$h"/* ]]
 }
 
-# public/storage pointing into home (e.g. an absolute storage:link made before moving) → prints target
+# Web root: the folder Apache serves, stored per site relative to the project
+# ("public" for Laravel, "." for a plain PHP app that keeps index.php at the top).
+site_docroot() { if [[ $2 == . ]]; then printf '%s' "$1"; else printf '%s/%s' "$1" "$2"; fi; }
+
+# The page Apache opens first in a web root (index.php, else index.html).
+docroot_index() {
+  local f
+  for f in index.php index.html index.htm; do [[ -f $1/$f ]] && { printf '%s/%s' "$1" "$f"; return 0; }; done
+  return 1
+}
+
+# Guess the web root of the project at $1: public/ (Laravel, Symfony, Slim …), the project
+# folder itself, then the other usual names.
+detect_root() {
+  local d
+  docroot_index "$1/public" >/dev/null && { echo public; return 0; }
+  docroot_index "$1" >/dev/null && { echo .; return 0; }
+  for d in web public_html htdocs www html; do
+    docroot_index "$1/$d" >/dev/null && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Normalise a --root value to a path relative to the project; dies if it leaves the project.
+normalize_root() {
+  local path=$1 r=$2 abs
+  [[ $r == /* ]] || r=$path/$r
+  [[ -d $r ]] || die "web root $r is not a folder"
+  abs=$(cd "$r" && pwd -P)
+  [[ $abs == "$path" ]] && { echo .; return 0; }
+  [[ $abs == "$path"/* ]] || die "web root $abs is outside the project $path"
+  printf '%s\n' "${abs#"$path"/}"
+}
+
+is_laravel() { [[ -f $1/artisan ]]; }
+
+# <webroot>/storage pointing into home (e.g. an absolute storage:link made before moving) → prints target
 storage_link_in_home() {
   local t
-  [[ -L $1/public/storage ]] || return 1
-  t=$(readlink -f "$1/public/storage") || return 1
+  [[ -L $1/storage ]] || return 1
+  t=$(readlink -f "$1/storage") || return 1
   in_home "$t" && printf '%s\n' "$t"
 }
 
@@ -305,9 +342,10 @@ www_reaches() { # every ancestor of $1 traversable
   while d=$(dirname "$d"); [[ $d != / ]]; do www_has "$d" x || return 1; done
 }
 
-acl_ok() {
-  local pub=$1/public t
-  www_reaches "$pub" && www_has "$pub" x && www_has "$pub" r && www_has "$pub/index.php" r || return 1
+acl_ok() { # acl_ok <webroot>
+  local pub=$1 t idx
+  www_reaches "$pub" && www_has "$pub" x && www_has "$pub" r || return 1
+  if idx=$(docroot_index "$pub"); then www_has "$idx" r || return 1; fi
   if [[ -L $pub/storage ]]; then
     t=$(readlink -f "$pub/storage") || return 0
     [[ -d $t ]] || return 0
@@ -330,8 +368,8 @@ acl_grant_tree() { # traverse to $1, read the tree, default ACL for new files
   find "$t" -type d -exec setfacl -m d:u:www-data:rX {} +
 }
 
-do_acl() {
-  local pub=$1/public t
+do_acl() { # do_acl <webroot>
+  local pub=$1 t
   acl_grant_tree "$pub"
   if [[ -L $pub/storage ]] && t=$(readlink -f "$pub/storage") && [[ -d $t ]] && ! in_home "$t"; then
     acl_grant_tree "$t"
@@ -366,20 +404,33 @@ EOF
 vhost_file() { printf '%s/berth-%s.conf' "$VHOST_DIR" "$1"; }
 vhost_enabled() { [[ -e /etc/apache2/sites-enabled/berth-$1.conf ]]; }
 
-vhost_content() {
-  local name=$1 path=$2 php=$3
+vhost_content() { # vhost_content <name> <project> <php> [root]
+  local name=$1 path=$2 php=$3 root=${4:-public} doc
+  doc=$(site_docroot "$path" "$root")
   cat <<EOF
 # Managed by berth. Changes are overwritten by \`berth host\`.
 <VirtualHost *:80>
     ServerName $name.localhost
     ServerAlias *.$name.localhost
-    DocumentRoot "$path/public"
+    DocumentRoot "$doc"
 
-    <Directory "$path/public">
+    <Directory "$doc">
         Options FollowSymLinks
         AllowOverride All
         Require all granted
     </Directory>
+EOF
+  # Serving the project folder itself would publish .git and .env; keep them private.
+  [[ $root == . ]] && cat <<EOF
+
+    <DirectoryMatch "/\.(git|svn|hg)(/|\$)">
+        Require all denied
+    </DirectoryMatch>
+    <FilesMatch "^\.env">
+        Require all denied
+    </FilesMatch>
+EOF
+  cat <<EOF
 
     <FilesMatch "\.php$">
         SetHandler "proxy:unix:$(pool_sock "$php")|fcgi://berth-php$php"
@@ -668,7 +719,7 @@ preflight() {
 
 # ---------------------------------------------------------------- argument parsing
 
-OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER=
+OPT_PHP= OPT_NODE= OPT_NAME= OPT_EXT= OPT_COMPOSER= OPT_ROOT=
 ARGS=()
 parse_opts() {
   while (( $# )); do
@@ -681,6 +732,8 @@ parse_opts() {
       --name=*) OPT_NAME=${1#*=} ;;
       --composer) OPT_COMPOSER=${2:?--composer needs a version}; shift ;;
       --composer=*) OPT_COMPOSER=${1#*=} ;;
+      --root) OPT_ROOT=${2:?--root needs a folder}; shift ;;
+      --root=*) OPT_ROOT=${1#*=} ;;
       --ext) OPT_EXT+=",${2:?--ext needs a list}"; shift ;;
       --ext=*) OPT_EXT+=",${1#*=}" ;;
       -y|--yes) YES=1 ;;
@@ -792,7 +845,7 @@ cmd_install() {
   plan_nvm
   if run_plan; then success "berth is installed and this machine is ready"
   else success "berth is installed and this machine is already set up"; fi
-  detail "Next: put a Laravel project in $SITES_ROOT, cd into it and run berth host"
+  detail "Next: put a Laravel or PHP project in $SITES_ROOT, cd into it and run berth host"
 }
 
 cmd_install_php() {
@@ -866,7 +919,6 @@ cmd_host() {
   local path=${ARGS[0]:-$PWD}
   [[ -d $path ]] || die "no such directory: $path"
   path=$(cd "$path" && pwd -P)
-  [[ -f $path/public/index.php ]] || die "$path/public/index.php not found; is this a Laravel project?"
   if in_home "$path"; then
     die "$path is inside your home folder, which Apache can't enter.
        Move the project under $SITES_ROOT, e.g.:
@@ -876,8 +928,24 @@ cmd_host() {
 
   local existing old_name= old_php= old_node=
   existing=$(config_get path "$path")
-  local old_composer=
-  [[ -n $existing ]] && IFS=$'\t' read -r old_name _ old_php old_node old_composer <<<"$existing"
+  local old_composer= old_root=
+  [[ -n $existing ]] && IFS=$'\t' read -r old_name _ old_php old_node old_composer old_root <<<"$existing"
+  [[ -n $old_name && -z $old_root ]] && old_root=public
+
+  # web root: --root, else the site's current one, else detected
+  local root doc
+  if [[ -n $OPT_ROOT ]]; then root=$(normalize_root "$path" "$OPT_ROOT")
+  elif [[ -n $old_root ]]; then root=$old_root
+  elif ! root=$(detect_root "$path"); then
+    die "no index.php or index.html in $path or in its public/, web/, public_html/, htdocs/, www/ or html/.
+       Point berth at the folder to serve: berth host --root <folder>"
+  fi
+  doc=$(site_docroot "$path" "$root")
+  [[ -d $doc ]] || die "web root $doc does not exist"
+  docroot_index "$doc" >/dev/null || warn "$doc has no index.php or index.html; / will return 403 until one exists"
+  local kind="PHP app" serving
+  is_laravel "$path" && kind="Laravel app"
+  if [[ $root == . ]]; then serving="serving the project folder"; else serving="serving $root/"; fi
 
   # name
   local name
@@ -913,11 +981,13 @@ cmd_host() {
     local oc=${old_composer:--}
     title "Reconfiguring $name"
     hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    hdetail "${D}$kind · $serving${R}"
     hdetail "${YEL}Already hosted by berth${R} ${D}·${R} PHP $old_php ${D}·${R} Node ${old_node/-/none} ${D}·${R} Composer ${oc/#-/$DEFAULT_COMPOSER}"
     (( asking )) && printf '\n  %sEnter keeps the current version; type to change it.%s\n\n' "$D" "$R"
   else
     title "Hosting $name"
     hdetail "${CYN}http://$name.localhost${R}  ${D}$path${R}"
+    hdetail "${D}$kind · $serving${R}"
     (( asking )) && printf '\n  %sEnter keeps the suggested version; type to change it.%s\n\n' "$D" "$R"
   fi
 
@@ -956,7 +1026,7 @@ cmd_host() {
   [[ $node != - ]] && plan_node "$node"
   plan_composer "$composer"
 
-  acl_ok "$path" || plan_user "grant www-data read access to $path/public (ACLs, traversal on parent dirs)" do_acl "$path"
+  acl_ok "$doc" || plan_user "grant www-data read access to $doc (ACLs, traversal on parent dirs)" do_acl "$doc"
 
   if [[ -n $old_name && $old_name != "$name" ]]; then
     plan_root "remove old vhost berth-$old_name (renamed to $name)" do_vhost_remove "$old_name"
@@ -965,22 +1035,24 @@ cmd_host() {
 
   local vf vc
   vf=$(vhost_file "$name")
-  vc=$(vhost_content "$name" "$path" "$php")
+  vc=$(vhost_content "$name" "$path" "$php" "$root")
   if [[ ! -f $vf || $(cat "$vf") != "$vc" ]] || ! vhost_enabled "$name"; then
     plan_root "write and enable vhost $vf (http://$name.localhost → PHP $php)" do_vhost "$name" "$vc"
     queue_apache_apply
   fi
 
   local want
-  want=$(printf '%s\t%s\t%s\t%s\t%s' "$name" "$path" "$php" "$node" "$composer")
-  [[ $existing == "$want" ]] || plan_user "record $name in $CONFIG" do_config_set "$name" "$path" "$php" "$node" "$composer"
+  want=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$name" "$path" "$php" "$node" "$composer" "$root")
+  # A line from before web roots (no root column) is the same site when its root is public.
+  [[ $existing == "$want" || ( $root == public && "$existing"$'\tpublic' == "$want" ) ]] \
+    || plan_user "record $name in $CONFIG" do_config_set "$name" "$path" "$php" "$node" "$composer" "$root"
 
   local changed=1
   run_plan || changed=0
   local st
-  if st=$(storage_link_in_home "$path"); then
-    warn "public/storage points into your home ($st), so uploaded files will return 403.
-         Recreate it: rm $path/public/storage && berth php artisan storage:link"
+  if is_laravel "$path" && st=$(storage_link_in_home "$doc"); then
+    warn "$root/storage points into your home ($st), so uploaded files will return 403.
+         Recreate it: rm $doc/storage && berth php artisan storage:link"
   fi
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "http://$name.localhost/" || true)
@@ -988,15 +1060,19 @@ cmd_host() {
     failure "$name is set up, but http://$name.localhost answered HTTP $code"
     detail "Site error log: /var/log/apache2/berth-$name-error.log"
     detail "PHP log:        /var/log/php$php-fpm.log"
-    detail "Laravel log:    $path/storage/logs/laravel.log"
+    is_laravel "$path" && detail "Laravel log:    $path/storage/logs/laravel.log"
     return 1
   fi
   if (( ! changed )); then success "$name is unchanged and live at http://$name.localhost"
   elif [[ -n $old_name ]]; then success "$name is reconfigured and live at http://$name.localhost"
   else success "$name is live at http://$name.localhost"; fi
   detail "PHP $php · Node ${node/-/none} · Composer $composer"
-  detail "Set APP_URL=http://$name.localhost in .env"
-  detail "Run tools with these versions: berth php artisan …, berth composer …, berth npm …"
+  if is_laravel "$path"; then
+    detail "Set APP_URL=http://$name.localhost in .env"
+    detail "Run tools with these versions: berth php artisan …, berth composer …, berth npm …"
+  else
+    detail "Run tools with these versions: berth php …, berth composer …, berth npm …"
+  fi
 }
 
 cmd_rm() {
@@ -1021,16 +1097,17 @@ cmd_sites() {
   local lines
   lines=$(config_lines)
   if [[ -z $lines ]]; then
-    info "No sites yet. Put a Laravel project in $SITES_ROOT, cd into it and run berth host."
+    info "No sites yet. Put a project in $SITES_ROOT, cd into it and run berth host."
     return 0
   fi
   {
-    printf 'NAME\tURL\tPHP\tNODE\tCOMPOSER\tPATH\n'
-    while IFS=$'\t' read -r n p v nd c; do
+    printf 'NAME\tURL\tPHP\tNODE\tCOMPOSER\tPATH\tWEB ROOT\n'
+    while IFS=$'\t' read -r n p v nd c r; do
       local mark=
       [[ -d $p ]] || mark=' (missing)'
-      c=${c:--}
-      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$DEFAULT_COMPOSER}" "$p" "$mark"
+      c=${c:--} r=${r:-public}
+      [[ $r == . ]] && r=./ || r=$r/
+      printf '%s\thttp://%s.localhost\t%s\t%s\t%s\t%s%s\t%s\n' "$n" "$n" "$v" "${nd/-/none}" "${c/#-/$DEFAULT_COMPOSER}" "$p" "$mark" "$r"
     done <<<"$lines"
   } | column -t -s $'\t'
 }
@@ -1058,24 +1135,25 @@ cmd_doctor() {
   lines=$(config_lines)
   [[ -z $lines ]] && printf '  (none)\n'
   local versions=()
-  while IFS=$'\t' read -r n p v nd c; do
+  while IFS=$'\t' read -r n p v nd c r; do
     [[ -z ${n:-} ]] && continue
-    c=${c:--}
+    c=${c:--} r=${r:-public}
+    local doc idx
+    doc=$(site_docroot "$p" "$r")
     c=${c/#-/$DEFAULT_COMPOSER}
     versions+=("$v")
     local probs=()
-    [[ -f $p/public/index.php ]] || probs+=("path $p/public/index.php missing")
-    if [[ -f $p/public/index.php ]]; then
-      if sudo -n true 2>/dev/null; then
-        sudo -u www-data test -r "$p/public/index.php" || probs+=("www-data cannot read public/index.php (re-run berth host)")
-      else
-        acl_ok "$p" || probs+=("www-data cannot read public/ (re-run berth host)")
-      fi
+    if ! idx=$(docroot_index "$doc"); then
+      probs+=("no index.php or index.html in $doc")
+    elif sudo -n true 2>/dev/null; then
+      sudo -u www-data test -r "$idx" || probs+=("www-data cannot read $idx (re-run berth host)")
+    else
+      acl_ok "$doc" || probs+=("www-data cannot read $doc (re-run berth host)")
     fi
-    storage_link_in_home "$p" >/dev/null && probs+=("public/storage points into your home; recreate it with storage:link")
+    storage_link_in_home "$doc" >/dev/null && probs+=("$r/storage points into your home; recreate it with storage:link")
     in_home "$p" && probs+=("path is inside your home; move it under $SITES_ROOT")
     vhost_enabled "$n" || probs+=("vhost not enabled")
-    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v")" ]] || probs+=("vhost out of sync with config (re-run berth host)")
+    [[ -f $(vhost_file "$n") && $(cat "$(vhost_file "$n")") == "$(vhost_content "$n" "$p" "$v" "$r")" ]] || probs+=("vhost out of sync with config (re-run berth host)")
     [[ -S $(pool_sock "$v") ]] || probs+=("$(pool_sock "$v") missing (berth php:install $v)")
     [[ $nd == - ]] || node_bin "$nd" >/dev/null 2>&1 || probs+=("Node $nd not installed (berth node:install $nd)")
     [[ -f $(composer_phar "$c") ]] || probs+=("Composer $c not installed (berth composer:install $c)")
@@ -1084,7 +1162,7 @@ cmd_doctor() {
       printf '      %s\n' "${probs[@]}"
       fails=$((fails + 1))
     else
-      ok "$n (PHP $v, Node ${nd/-/none}, Composer $c) → $p"
+      ok "$n (PHP $v, Node ${nd/-/none}, Composer $c) → $doc"
     fi
   done <<<"$lines"
 
@@ -1160,7 +1238,7 @@ cmd_node_tool() {
 banner() {
   printf '\n'
   printf '  %s┏┓ ┏━╸┏━┓╺┳╸╻ ╻%s\n' "$CYN$B" "$R"
-  printf '  %s┣┻┓┣╸ ┣┳┛ ┃ ┣━┫%s   %slocal Laravel sites%s %sv%s%s\n' "$CYN$B" "$R" "$B" "$R" "$D" "$BERTH_VERSION" "$R"
+  printf '  %s┣┻┓┣╸ ┣┳┛ ┃ ┣━┫%s   %slocal Laravel & PHP sites%s %sv%s%s\n' "$CYN$B" "$R" "$B" "$R" "$D" "$BERTH_VERSION" "$R"
   printf '  %s┗━┛┗━╸╹┗╸ ╹ ╹ ╹%s   %sApache · PHP-FPM · Node · Composer%s\n' "$CYN$B" "$R" "$D" "$R"
   printf '  %s≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈%s\n\n' "$CYN" "$R"
 }
@@ -1175,7 +1253,7 @@ Setup
   berth composer:install [v]          download Composer v (2, 2.2, 1 or x.y.z; default 2)
 
 Sites
-  berth host [path] [--name n] [--php v] [--node v|none] [--composer v] [--ext a,b]
+  berth host [path] [--name n] [--root dir] [--php v] [--node v|none] [--composer v] [--ext a,b]
                                       serve a project (or reconfigure it) at http://<name>.localhost
   berth sites                         list sites
   berth rm <name>                     remove a site

@@ -2,12 +2,12 @@
 
 ```text
 ┏┓ ┏━╸┏━┓╺┳╸╻ ╻
-┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel sites
+┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites
 ┗━┛┗━╸╹┗╸ ╹ ╹ ╹   Apache · PHP-FPM · Node · Composer
 ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
 ```
 
-Serve local Laravel projects at `http://<name>.localhost` with Apache and PHP-FPM, choosing the PHP, Node and Composer version for each site.
+Serve local Laravel and plain PHP projects at `http://<name>.localhost` with Apache and PHP-FPM, choosing the PHP, Node and Composer version for each site.
 
 berth is a single bash script. It installs what a site needs (the ondrej PHP PPA, PHP versions and extensions, Apache modules, nvm, Node and Composer), so one `berth host` can take a bare Ubuntu WSL distro to a working site.
 
@@ -15,12 +15,13 @@ berth is a single bash script. It installs what a site needs (the ondrej PHP PPA
 $ cd /srv/sites/shop && berth host
 
   ┏┓ ┏━╸┏━┓╺┳╸╻ ╻
-  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel sites v0.1.0
+  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.1.0
   ┗━┛┗━╸╹┗╸ ╹ ╹ ╹   Apache · PHP-FPM · Node · Composer
   ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
 
   Hosting shop
   http://shop.localhost  /srv/sites/shop
+  Laravel app · serving public/
 
   Enter keeps the suggested version; type to change it.
 
@@ -96,6 +97,21 @@ berth npm run dev                    # runs with the site's Node
 
 Open `http://shop.localhost` in any browser.
 
+### Plain PHP apps
+
+`berth host` works the same way for a project that isn't Laravel. It finds the folder to serve (the web root) by looking for `index.php` or `index.html`, in this order:
+
+1. `public/`
+2. the project folder itself
+3. `web/`, `public_html/`, `htdocs/`, `www/`, `html/`
+
+```
+mkdir /srv/sites/blog && echo '<?php phpinfo();' > /srv/sites/blog/index.php
+cd /srv/sites/blog && berth host     # → http://blog.localhost
+```
+
+Use `--root <folder>` to serve some other folder, for example `berth host --root dist`. The folder must be inside the project. `.htaccess` files work as usual. When the project folder itself is the web root, berth blocks web access to `.git`, `.svn`, `.hg` and `.env*`.
+
 ## Commands
 
 ### Setup
@@ -112,7 +128,7 @@ Open `http://shop.localhost` in any browser.
 | Command | What it does |
 | --- | --- |
 | `berth host [path]` | Serve the project at `path` (default: current folder), or reconfigure it if it's already hosted |
-| `berth sites` | List sites: name, URL, PHP, Node, Composer, path |
+| `berth sites` | List sites: name, URL, PHP, Node, Composer, path, web root |
 | `berth rm <name>` | Remove the site's vhost and config entry |
 | `berth doctor` | Read-only health check of Apache, every site and the PHP pools, with a fix for each problem |
 
@@ -124,6 +140,7 @@ Open `http://shop.localhost` in any browser.
 | `--node 20` / `--node none` | Node version, or no Node |
 | `--composer 2.2` | Composer version |
 | `--name shop` | Site name. Default: the folder name. The URL is `http://<name>.localhost` |
+| `--root web` | Folder to serve, relative to the project (`.` for the project folder). Default: detected; see [Plain PHP apps](#plain-php-apps) |
 | `--ext redis,imagick` | Extra PHP extensions |
 
 ### Run tools with the site's versions
@@ -162,13 +179,13 @@ Every changing command first checks the current state and runs only the missing 
 
 **PHP-FPM:** each PHP version gets a pool called `berth`, at `/etc/php/<v>/fpm/pool.d/berth.conf`. It runs as **your user** and listens on `/run/php/php<v>-berth.sock`. Laravel's `storage/` and `bootstrap/cache/` are written as you, so files created by artisan and by the web server never conflict.
 
-**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot <project>/public`, `AllowOverride All` for Laravel's `.htaccess`, and PHP handed to that version's berth socket. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
+**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot` set to the web root (`<project>/public` for Laravel), `AllowOverride All` so `.htaccess` files work, and PHP handed to that version's berth socket. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
 
-**Registry:** `~/.config/berth/sites`, one line per site, tab-separated: `name  path  php  node  composer`. Vhosts are generated from it, so don't edit the vhost files by hand; re-run `berth host` instead.
+**Registry:** `~/.config/berth/sites`, one line per site, tab-separated: `name  path  php  node  composer  root`. Vhosts are generated from it, so don't edit the vhost files by hand; re-run `berth host` instead.
 
 ### Permissions
 
-Apache runs as `www-data` and must be able to pass through every folder on the way to `public/`. Ubuntu home folders are `750`, so Apache can't reach projects in `~`. berth keeps projects in **`/srv/sites`**, owned by you, group `www-data`, mode `750`. Apache gets in through the group, other users don't, and you work there without sudo.
+Apache runs as `www-data` and must be able to pass through every folder on the way to the web root. Ubuntu home folders are `750`, so Apache can't reach projects in `~`. berth keeps projects in **`/srv/sites`**, owned by you, group `www-data`, mode `750`. Apache gets in through the group, other users don't, and you work there without sudo.
 
 `berth host` refuses projects inside your home folder and prints the `mv` command to use instead. Tip: `ln -s /srv/sites ~/projects` keeps old paths working in your shell.
 
@@ -179,7 +196,7 @@ Start with `berth doctor`. It lists each problem with the command that fixes it.
 - **The site returns 500.** Check, in order:
   - `/var/log/apache2/berth-<name>-error.log`
   - `/var/log/php<v>-fpm.log`
-  - the project's `storage/logs/laravel.log`
+  - for Laravel, the project's `storage/logs/laravel.log`
 
   A fresh Laravel app also needs a reachable database if it uses database sessions or cache.
 - **Uploaded files return 403 after moving a project.** `public/storage` is an absolute symlink that still points into your home. Recreate it: `rm public/storage && berth php artisan storage:link`.
