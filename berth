@@ -4,7 +4,7 @@
 # License: MIT (see LICENSE). https://github.com/sajidifti/berth
 set -euo pipefail
 
-BERTH_VERSION=0.4.0
+BERTH_VERSION=0.5.0
 NVM_TAG=v0.41.0
 BERTH_REPO=sajidifti/berth
 BERTH_REF=${BERTH_REF:-main}   # branch or tag to install from when piped from curl
@@ -484,14 +484,35 @@ EOF
 EOF
 }
 
+# Port 80 of an HTTPS site. 307 rather than 301: browsers cache a 301, which would keep sending
+# them to HTTPS after --no-ssl, and a 307 also keeps POST requests intact. SERVER_NAME is the
+# requested host without its port, so subdomains survive and a forwarded :8080 isn't carried over.
+vhost_redirect() { # vhost_redirect <name>
+  local name=$1
+  cat <<EOF
+<VirtualHost *:80>
+    ServerName $name.localhost
+    ServerAlias *.$name.localhost
+
+    RewriteEngine On
+    RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [R=307,L]
+
+    ErrorLog \${APACHE_LOG_DIR}/berth-$name-error.log
+    CustomLog \${APACHE_LOG_DIR}/berth-$name-access.log combined
+</VirtualHost>
+EOF
+}
+
 vhost_content() { # vhost_content <name> <project> <php> [root] [ssl]
   local name=$1 path=$2 php=$3 root=${4:-public} ssl=${5:--} doc
   doc=$(site_docroot "$path" "$root")
   printf '# Managed by berth. Changes are overwritten by `berth site:host`.\n'
-  vhost_block 80 "$name" "$doc" "$root" "$php"
   if [[ $ssl == ssl ]]; then
+    vhost_redirect "$name"
     printf '\n'
     vhost_block 443 "$name" "$doc" "$root" "$php"
+  else
+    vhost_block 80 "$name" "$doc" "$root" "$php"
   fi
 }
 
@@ -855,7 +876,7 @@ ask_ssl() {
   local def=$1 name=$2 a=$1 hint='[y/N]'
   [[ $def == y ]] && hint='[Y/n]'
   if (( ! YES )) && [[ -r /dev/tty ]]; then
-    printf '  %s%-9s%s %salso serve https://%s.localhost?%s\n' "$B" "HTTPS" "$R" "$D" "$name" "$R" >&2
+    printf '  %s%-9s%s %sserve https://%s.localhost and redirect http to it?%s\n' "$B" "HTTPS" "$R" "$D" "$name" "$R" >&2
     local prompt=$'\001'"$CYN$B"$'\002'"> "$'\001'"$R"$'\002'
     while :; do
       read -e -r -p "            $prompt$hint " a </dev/tty || die "aborted"

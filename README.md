@@ -15,7 +15,7 @@ berth is a single bash script. It installs what a site needs (the ondrej PHP PPA
 $ cd /srv/sites/shop && berth site:host
 
   ┏┓ ┏━╸┏━┓╺┳╸╻ ╻
-  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.4.0
+  ┣┻┓┣╸ ┣┳┛ ┃ ┣━┫   local Laravel & PHP sites v0.5.0
   ┗━┛┗━╸╹┗╸ ╹ ╹ ╹   Apache · PHP-FPM · Node · Composer
   ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
 
@@ -33,7 +33,7 @@ $ cd /srv/sites/shop && berth site:host
             > 26
   Composer  installed  2.11.1
             > 2
-  HTTPS     also serve https://shop.localhost?
+  HTTPS     serve https://shop.localhost and redirect http to it?
             > [y/N]
 
   [1/3] write and enable vhost /etc/apache2/sites-available/berth-shop.conf (http://shop.localhost → PHP 8.5)
@@ -86,14 +86,14 @@ git clone https://github.com/sajidifti/berth.git && cd berth && ./berth install
 Each step is skipped if it's already done, so running `berth install` again only repairs what's missing. To install a specific release instead of `main`, use the tag in the URL and in `BERTH_REF`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.4.0/berth | BERTH_REF=v0.4.0 bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/sajidifti/berth/v0.5.0/berth | BERTH_REF=v0.5.0 bash -s -- install
 ```
 
 ### Update
 
 ```bash
 berth update                  # latest main
-berth update --ref v0.4.0     # a specific release
+berth update --ref v0.5.0     # a specific release
 ```
 
 `berth update` downloads berth from GitHub and replaces `~/.local/bin/berth`, showing the old and new version. It changes nothing else.
@@ -135,7 +135,7 @@ The domain is always a single word under `.localhost`, because browsers resolve 
 
 ### HTTPS
 
-`berth site:host` asks whether to also serve the site over HTTPS. The answer defaults to no. Pressing `y` gives you `https://<name>.localhost`, and `http://` keeps working alongside it.
+`berth site:host` asks whether to serve the site over HTTPS. The answer defaults to no. Pressing `y` gives you `https://<name>.localhost`, and `http://` requests redirect to it, keeping the subdomain, path and query string. The redirect is a temporary 307, so browsers don't remember it after you turn HTTPS off.
 
 To switch later, run `berth site:host` in the project again and answer the question, where Enter keeps the current state. `--ssl` and `--no-ssl` skip the question.
 
@@ -297,7 +297,7 @@ Every changing command first checks the current state and runs only the missing 
 
 **PHP-FPM:** each PHP version gets a pool called `berth`, at `/etc/php/<v>/fpm/pool.d/berth.conf`. It runs as **your user** and listens on `/run/php/php<v>-berth.sock`. Laravel's `storage/` and `bootstrap/cache/` are written as you, so files created by artisan and by the web server never conflict.
 
-**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot` set to the web root (`<project>/public` for Laravel), `AllowOverride All` so `.htaccess` files work, and PHP handed to that version's berth socket. A site with HTTPS gets a second, matching vhost on port 443, with its certificate in `/etc/apache2/berth-ssl/`. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
+**Apache:** one vhost per site, `/etc/apache2/sites-available/berth-<name>.conf`, with `ServerName <name>.localhost` and `*.<name>.localhost`, `DocumentRoot` set to the web root (`<project>/public` for Laravel), `AllowOverride All` so `.htaccess` files work, and PHP handed to that version's berth socket. A site with HTTPS is served by a vhost on port 443, with its certificate in `/etc/apache2/berth-ssl/`, and its port 80 vhost only redirects to it. berth runs `apache2ctl configtest` before every reload and rolls the vhost back if the test fails. Logs are `/var/log/apache2/berth-<name>-{error,access}.log`.
 
 **Registry:** `~/.config/berth/sites`, one line per site, tab-separated: `name  path  php  node  composer  root  ssl`. Vhosts are generated from it, so don't edit the vhost files by hand; re-run `berth site:host` instead.
 
